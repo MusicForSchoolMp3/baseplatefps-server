@@ -29,12 +29,13 @@ const MODES = ['tdm', 'ffa', 'lms'];
 const MODE_NAMES = { tdm: 'Team deathmatch', ffa: 'Free for all', lms: 'Last man standing' };
 const TEAM_NAMES = ['Blue', 'Red'];
 const WEAPONS = {
-  rifle:  { interval: 60 / 750, body: 20, head: 45, range: 330 },
-  pistol: { interval: 60 / 420, body: 24, head: 55, range: 150, falloffAt: 40, falloff: 0.75 },
-  sniper: { interval: 1.6,      body: 85, head: 150, range: 720 },     // one round, then a reload
+  rifle:  { interval: 60 / 750, body: 20, head: 45, range: 330, mag: 30, reload: 2100 },
+  pistol: { interval: 60 / 420, body: 24, head: 55, range: 150, falloffAt: 40, falloff: 0.75, mag: 12, reload: 1500 },
+  sniper: { interval: 1.6,      body: 85, head: 150, range: 720, mag: 1, reload: 2200 },     // one round, then a reload
 };
 const WEAPON_LIST = ['rifle', 'pistol', 'sniper'];
 const SWITCH_LOCK_MS = 900;                                  // client waits 1.0 s; a little slack for lag
+const RELOAD_SLACK_MS = 250;                                 // allow for lag before a reload is "done"
 
 /* ---------- Firebase ---------- */
 let admin = null, db = null;
@@ -68,6 +69,9 @@ async function verifyToken(token) {
   return { uid: d.uid, email: d.email || '' };
 }
 
+const modRec = new Map();     // uid -> { banned, tamperAt } — cheater warnings and bans, server-only
+const TAMPER_BAN_MS = (Number(process.env.TAMPER_BAN_S) || 5 * 60 * 60) * 1000;   // a second DevTools open within 5 hours is a ban
+
 async function loadProfile(who, requestedHead) {
   const fromEmail = String(who.email).split('@')[0];
   let name = who.devName || fromEmail, head = requestedHead === 'fish' ? 'fish' : 'none';
@@ -78,11 +82,31 @@ async function loadProfile(who, requestedHead) {
       if (typeof u.username === 'string' && u.username.toLowerCase() === fromEmail) name = u.username;
       if (u.avatar && typeof u.avatar.head === 'string') head = u.avatar.head === 'fish' ? 'fish' : 'none';
       if (u.stats && typeof u.stats === 'object') for (const k of Object.keys(blankStats())) stats[k] = Number(u.stats[k]) || 0;
+      if (u.mod && typeof u.mod === 'object' && !modRec.has(who.uid)) modRec.set(who.uid, { banned: !!u.mod.banned, tamperAt: Number(u.mod.tamperAt) || 0 });
     } catch (e) { console.warn('Could not read profile', who.uid, e.message); }
   }
   memStats.set(who.uid, stats);
   if (!USER_RE.test(name)) name = (fromEmail.replace(/[^A-Za-z0-9]/g, '').slice(0, 20)) || 'Player';
-  return { name, stats, head };
+  return { name, stats, head, banned: (modRec.get(who.uid) || {}).banned };
+}
+
+function onTamper(p) {
+  const now = Date.now();
+  const rec = modRec.get(p.uid) || { banned: false, tamperAt: 0 };
+  if (rec.banned) return banPlayer(p, rec);
+  if (rec.tamperAt && now - rec.tamperAt < TAMPER_BAN_MS) { rec.banned = true; rec.tamperAt = now; modRec.set(p.uid, rec); banPlayer(p, rec); }
+  else {
+    rec.tamperAt = now; modRec.set(p.uid, rec);
+    if (db) db.ref('users/' + p.uid + '/mod').update({ tamperAt: admin.database.ServerValue.TIMESTAMP }).catch(e => console.warn('mod write failed', e.message));
+    console.log(`${p.name} warned for opening DevTools`);
+  }
+}
+function banPlayer(p, rec) {
+  if (db) db.ref('users/' + p.uid + '/mod').update({ banned: true, bannedAt: admin.database.ServerValue.TIMESTAMP }).catch(e => console.warn('ban write failed', e.message));
+  console.log(`${p.name} BANNED (repeat DevTools within 5h)`);
+  send(p, { t: 'err', code: 'banned' });
+  if (p.room) leaveRoom(p, 'banned');
+  setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 400);
 }
 
 function addStats(uid, delta) {
@@ -154,6 +178,8 @@ function spawn(room, p) {
   const yw = r2(Math.atan2(x, z));
   p.s.p = [x, 0, z]; p.s.v = [0, 0, 0]; p.s.yw = yw; p.lastPosAt = Date.now();
   p.hp = 100; p.alive = true; p.zoneAcc = 0; p.respawnAt = 0; p.protectUntil = Date.now() + PROTECT_MS;
+  for (const id of WEAPON_LIST) p.ammo[id] = WEAPONS[id].mag;
+  p.reloadUntil = 0;
   send(p, { t: 'spawn', p: p.s.p, yw });
 }
 function aliveIn(room) {
@@ -236,7 +262,7 @@ function kill(room, victim, killer, weapon, head, byZone, quit) {
   }
   const place = room.mode === 'lms' ? aliveIn(room).length + 1 : 0;
   broadcast(room, { t: 'kill', k: killer ? killer.name : '', v: victim.name, w: weapon || '', hs: head ? 1 : 0, z: byZone ? 1 : 0, left: quit ? 1 : 0 });
-  if (!quit) send(victim, { t: 'died', by: byZone ? 'the zone' : killer ? killer.name : '', place, respawn: room.mode !== 'lms' && live ? RESPAWN_MS : 0 });
+  if (!quit) send(victim, { t: 'died', by: byZone ? 'the zone' : killer ? killer.name : '', byId: killer && !byZone ? killer.id : 0, place, respawn: room.mode !== 'lms' && live ? RESPAWN_MS : 0 });
   console.log(`${room.code}: ${byZone ? 'the zone' : killer ? killer.name : '?'} eliminated ${victim.name}${weapon ? ' (' + weapon + (head ? ', headshot' : '') + ')' : ''}${quit ? ' (left the match)' : ''}`);
 }
 
@@ -347,6 +373,7 @@ async function onHello(p, msg) {
   if (p.ws.readyState !== 1) return;
   const prof = await loadProfile(who, msg.cos);
   if (p.ws.readyState !== 1) return;
+  if (prof.banned) { send(p, { t: 'err', code: 'banned' }); setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 400); return; }
   const old = byUid.get(who.uid);
   if (old && old !== p) { send(old, { t: 'err', code: 'elsewhere' }); leaveRoom(old, 'signed in elsewhere'); try { old.ws.close(); } catch (_) {} }
 
@@ -371,26 +398,52 @@ async function onHello(p, msg) {
 }
 
 function onUpdate(p, msg) {
-  const s = p.s, now = Date.now(), half = mapOf(p.room).half;
+  const s = p.s, now = Date.now(), map = mapOf(p.room), half = map.half;
   const pos = vec3(msg.p, half + 2);
   if (pos) {
-    pos[1] = clamp(pos[1], 0, 12);
+    pos[0] = clamp(pos[0], -half, half); pos[2] = clamp(pos[2], -half, half); pos[1] = clamp(pos[1], 0, 12);
     const dtS = Math.max(0.02, (now - (p.lastPosAt || now)) / 1000);
     const moved = Math.hypot(pos[0] - s.p[0], pos[2] - s.p[2]);
-    if (moved <= 9.5 * dtS + 1.5 || !p.alive || DEV_TOKENS) { s.p = pos; p.lastPosAt = now; }   // speed limit (off for local tests)
-    else if (now - (p.lastFixAt || 0) > 1000) { p.lastFixAt = now; send(p, { t: 'pos', p: s.p }); }
+    // local tests use dev tokens and teleport bots around; AC_FORCE turns the checks on anyway to test them
+    const check = p.alive && (!DEV_TOKENS || process.env.AC_FORCE);
+    const bad = check && (
+      moved > 9.5 * dtS + 1.5 ||                                           // faster than a sprint can carry you
+      MAPS.illegalStand(map, pos[0], pos[1], pos[2]) ||                    // inside a wall, or floating
+      MAPS.crossedWall(map, s.p[0], s.p[2], pos[0], pos[2], Math.min(s.p[1], pos[1])));   // stepped through a wall
+    if (bad) {
+      if (now - (p.lastFixAt || 0) > 500) { p.lastFixAt = now; send(p, { t: 'pos', p: s.p }); }   // snap them back
+    } else { s.p = pos; p.lastPosAt = now; }
   }
   const v = vec3(msg.v, 40); if (v) s.v = v;
   s.yw = num(msg.yw, s.yw); s.pt = clamp(num(msg.pt, s.pt), -1.6, 1.6);
   s.g = !!msg.g; s.sp = !!msg.sp; s.ad = !!msg.ad; s.rl = !!msg.rl;
-  if (typeof msg.w === 'string' && msg.w !== s.w && p.loadout.includes(msg.w)) { s.w = msg.w; p.wSince = now; }
+  if (typeof msg.w === 'string' && msg.w !== s.w && p.loadout.includes(msg.w)) { s.w = msg.w; p.wSince = now; p.reloadUntil = 0; }   // switching cancels a reload, like on the client
+}
+
+function refreshAmmo(p, now) {                                            // a reload finishes lazily, when it next matters
+  if (p.reloadUntil && now >= p.reloadUntil - RELOAD_SLACK_MS) { p.ammo[p.reloadWeapon] = WEAPONS[p.reloadWeapon].mag; p.reloadUntil = 0; }
+}
+function startReload(p, now) {
+  if (p.reloadUntil || !WEAPONS[p.s.w]) return;
+  p.reloadWeapon = p.s.w; p.reloadUntil = now + WEAPONS[p.s.w].reload;
+}
+function onReload(p) {
+  const now = Date.now(), w = WEAPONS[p.s.w];
+  if (!p.alive || !w) return;
+  refreshAmmo(p, now);
+  if (!p.reloadUntil && p.ammo[p.s.w] < w.mag) startReload(p, now);
 }
 
 function onShot(p, msg) {
-  const room = p.room, now = Date.now(), w = WEAPONS[p.s.w];
-  if (!room || !w || !p.alive || msg.w !== p.s.w) return;
+  const room = p.room, now = Date.now(), wid = p.s.w, w = WEAPONS[wid];
+  if (!room || !w || !p.alive || msg.w !== wid) return;
   if (now - p.wSince < SWITCH_LOCK_MS) return;                             // just switched weapons
+  refreshAmmo(p, now);
+  if (p.reloadUntil && now < p.reloadUntil - RELOAD_SLACK_MS) return;      // still reloading
   if (now - p.lastShot < w.interval * 1000 * 0.8) return;                  // faster than the gun can fire
+  if (p.ammo[wid] <= 0) { startReload(p, now); return; }                   // out of ammo: no free shots
+  p.ammo[wid]--;
+  if (p.ammo[wid] <= 0) startReload(p, now);
   p.lastShot = now;
   p.shots++;
   p.protectUntil = 0;                                                      // shooting ends spawn protection
@@ -401,19 +454,21 @@ function onShot(p, msg) {
   if (room.mode === 'tdm' && target.team === p.team) return;              // no friendly fire
   if (now < target.protectUntil) return;
   const ex = p.s.p[0], ey = p.s.p[1] + 1.65, ez = p.s.p[2];
-  const tx = target.s.p[0], ty = target.s.p[1] + 1.0, tz = target.s.p[2];
-  const dist = Math.hypot(tx - ex, ty - ey, tz - ez);
-  if (dist > w.range + 4) return;
-  // the shot has to be roughly where the shooter is looking
+  const feet = target.s.p[1], tx = target.s.p[0], tz = target.s.p[2];
   const cy = Math.cos(p.s.pt);
-  const ax = -Math.sin(p.s.yw) * cy, ay = Math.sin(p.s.pt), az = -Math.cos(p.s.yw) * cy;
-  const dot = (ax * (tx - ex) + ay * (ty - ey) + az * (tz - ez)) / Math.max(dist, 0.01);
-  if (Math.acos(clamp(dot, -1, 1)) > 0.4 + Math.atan(1.4 / Math.max(dist, 0.5))) return;
-  // and no wall in the way of both the body and the head
+  const ax = -Math.sin(p.s.yw) * cy, ay = Math.sin(p.s.pt), az = -Math.cos(p.s.yw) * cy;   // the shooter's own aim
+  // how far along the aim ray the shot passes the target, and where on the target it lands
+  const th = ((tx - ex) * ax + (tz - ez) * az) / Math.max(ax * ax + az * az, 1e-4);
+  if (th <= 0 || th > w.range + 4) return;
+  const px = ex + ax * th, py = ey + ay * th, pz = ez + az * th;
+  const horiz = Math.hypot(px - tx, pz - tz), rise = py - feet;
+  if (horiz > 0.4 || rise < -0.1 || rise > 1.9) return;                  // the aim isn't actually on the body: no hit (kills aimbot-less wallbangs/fake hits)
+  // no wall between the shooter and where the shot lands
   const map = mapOf(room);
-  if (MAPS.blocked(map, ex, ey, ez, tx, ty, tz) && MAPS.blocked(map, ex, ey, ez, tx, target.s.p[1] + 1.65, tz)) return;
+  if (MAPS.blocked(map, ex, ey, ez, px, py, pz)) return;
+  const head = rise >= 1.5 && horiz <= 0.2;                              // the server decides headshots, not the client
 
-  const head = !!msg.hd;
+  const dist = Math.hypot(tx - ex, feet + 1 - ey, tz - ez);
   let dmg = head ? w.head : w.body;
   if (w.falloffAt && dist > w.falloffAt) dmg = Math.round(dmg * w.falloff);
   target.hp -= dmg;
@@ -421,7 +476,7 @@ function onShot(p, msg) {
   const killed = target.hp <= 0;
   send(p, { t: 'hit', hd: head ? 1 : 0, k: killed ? 1 : 0 });
   send(target, { t: 'hurt', a: dmg, x: r2(ex), z: r2(ez) });
-  if (killed) kill(room, target, p, p.s.w, head, false);
+  if (killed) kill(room, target, p, wid, head, false);
 }
 
 function onVote(p, msg) {
@@ -437,6 +492,7 @@ const server = http.createServer((req, res) => {
   let players = 0; for (const r of rooms.values()) players += r.players.size;
   res.writeHead(200, { 'content-type': 'text/plain', 'access-control-allow-origin': '*' });
   if (DEV_TOKENS && req.url === '/stats') { res.end(JSON.stringify(Object.fromEntries(memStats))); return; }
+  if (DEV_TOKENS && req.url === '/mod') { res.end(JSON.stringify(Object.fromEntries(modRec))); return; }
   const pub = rooms.get('PUBLIC');
   res.end(`Baseplate FPS game server is running. ${players} playing right now. Public match: ${MODE_NAMES[pub.mode]} on ${mapOf(pub).name} (${pub.phase}).\n`);
 });
@@ -447,6 +503,7 @@ wss.on('connection', ws => {
     s: { p: [0, 0, 0], v: [0, 0, 0], yw: 0, pt: 0, g: true, sp: false, ad: false, rl: false, w: 'rifle' },
     hp: 100, alive: true, part: 0, team: -1, kills: 0, deaths: 0, shots: 0, se: [0, 0, 0], lastShot: 0, wSince: 0, zoneAcc: 0,
     respawnAt: 0, protectUntil: 0, lastHurtBy: null, lastHurtAt: 0, voteMode: '', voteMap: '',
+    ammo: { rifle: 30, pistol: 12, sniper: 1 }, reloadUntil: 0, reloadWeapon: '',
     lastPosAt: 0, lastFixAt: 0, msgs: 0, msgWindow: Date.now() };
   const helloTimer = setTimeout(() => { if (!p.authed) ws.close(); }, 15000);
   ws.on('pong', () => { ws._bpMissed = false; });
@@ -457,9 +514,11 @@ wss.on('connection', ws => {
     let msg; try { msg = JSON.parse(raw); } catch (_) { return; }
     if (!msg || typeof msg !== 'object') return;
     if (!p.authed) { if (msg.t === 'hello' && !p.helloSeen) { p.helloSeen = true; onHello(p, msg).catch(e => { console.error(e); ws.close(); }); } return; }
+    if (msg.t === 'tamper') { onTamper(p); return; }                        // DevTools opened on their page
     if (!p.room) return;
     if (msg.t === 'u') onUpdate(p, msg);
     else if (msg.t === 'f') onShot(p, msg);
+    else if (msg.t === 'reload') onReload(p);
     else if (msg.t === 'vote') onVote(p, msg);
     else if (msg.t === 'leave') { leaveRoom(p, 'left'); ws.close(); }
   });

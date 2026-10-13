@@ -222,7 +222,47 @@
     return Math.abs(x) < map.half - r && Math.abs(z) < map.half - r;
   }
 
-  const api = { MAPS, MAP_LIST, rayBox, rayMap, blocked, move, clearAt, groundUnder, BODY: { R, HGT, STEP } };
+  // --- server anti-cheat checks (cheap point tests, no movement sim) ---
+  // is this point well inside a solid box? (used to catch standing inside / phasing through a wall)
+  function pointInSolid(map, x, y, z) {
+    const m = 0.06;
+    for (const b of map.boxes) if (x > b.x0 + m && x < b.x1 - m && z > b.z0 + m && z < b.z1 - m && y > b.y0 + m && y < b.y1 - m) return true;
+    return false;
+  }
+  // highest surface at or just below a point: the floor you could be standing or jumping from
+  function floorBelow(map, x, z, y) {
+    let f = 0;
+    for (const b of map.boxes) if (b.y1 <= y + 0.35 && b.y1 > f && x > b.x0 && x < b.x1 && z > b.z0 && z < b.z1) f = b.y1;
+    return f;
+  }
+  // true if a player at (x,y,z) is in a position they could not legitimately reach (inside a wall, or floating too high)
+  function illegalStand(map, x, y, z) {
+    if (y > floorBelow(map, x, z, y) + 2.9) return true;                 // a jump peaks under ~0.9 m; well above any surface = flying
+    return pointInSolid(map, x, y + 0.9, z) || pointInSolid(map, x, y + 1.6, z);
+  }
+  // does the horizontal segment a->b (as a body of radius r) pass through a box's footprint?
+  function segHitsBoxXZ(ax, az, bx, bz, b, r) {
+    const dx = bx - ax, dz = bz - az;
+    let t0 = 0, t1 = 1;
+    const slabs = [[ax, dx, b.x0 - r, b.x1 + r], [az, dz, b.z0 - r, b.z1 + r]];
+    for (const [o, d, lo, hi] of slabs) {
+      if (Math.abs(d) < 1e-9) { if (o < lo || o > hi) return false; continue; }
+      let s = (lo - o) / d, e = (hi - o) / d; if (s > e) { const t = s; s = e; e = t; }
+      if (s > t0) t0 = s; if (e < t1) t1 = e; if (t0 > t1) return false;
+    }
+    return true;
+  }
+  // true if walking from (ax,az) to (bx,bz) would cross a wall (a solid taller than a step, not above your head)
+  function crossedWall(map, ax, az, bx, bz, y) {
+    const r = R - 0.03;
+    for (const b of map.boxes) {
+      if (b.y1 <= y + STEP || b.y0 >= y + HGT) continue;
+      if (segHitsBoxXZ(ax, az, bx, bz, b, r)) return true;
+    }
+    return false;
+  }
+
+  const api = { MAPS, MAP_LIST, rayBox, rayMap, blocked, move, clearAt, groundUnder, pointInSolid, floorBelow, illegalStand, crossedWall, BODY: { R, HGT, STEP } };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.BPMaps = api;
 })(typeof window !== 'undefined' ? window : this);
