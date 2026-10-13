@@ -1,28 +1,37 @@
 'use strict';
 // Baseplate FPS game server.
-// Runs every match: one big public battle royale plus private rooms with codes.
-// Players sign in with Firebase; the server checks their sign-in, decides every hit, kill and
-// zone tick, and saves each account's stats to the Firebase Realtime Database.
+// Runs every match: one big public match plus private rooms with codes. Each room plays rounds of
+// free for all, team deathmatch or last man standing, then everyone votes on the next map and mode.
+// Players sign in with Firebase; the server checks their sign-in, decides every hit, kill and win,
+// and saves each account's stats to the Firebase Realtime Database.
 
 const http = require('http');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
+const MAPS = require('./maps.js');
 
 const PORT = Number(process.env.PORT) || 8080;
 const PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'baseplatefps-e1fc1';
 const DATABASE_URL = process.env.FIREBASE_DATABASE_URL || 'https://baseplatefps-e1fc1-default-rtdb.asia-southeast1.firebasedatabase.app';
 const DEV_TOKENS = process.env.DEV_TOKENS === '1';           // local testing only, never set this on Render
-const PROTO = 2;
+const PROTO = 3;
 const EMAIL_DOMAIN = 'players.baseplatefps.game';
 const USER_RE = /^[A-Za-z0-9]{3,20}$/;
 
 const TICK_HZ = 15;
-const COUNT_S = 8, GRACE_S = 25, SHRINK_S = 150, OVER_S = 8, R0 = 230, R1 = 14, ZONE_DPS = 4;
-const PUBLIC_MAX = 50, PRIVATE_MAX = 16, MAP_HALF = 255;
+const START_S = Number(process.env.START_S) || 6;            // everyone spawns and reads the round explainer
+const ROUND_S = Number(process.env.ROUND_S) || 600;          // 10 minute rounds
+const VOTE_S = Number(process.env.VOTE_S) || 20;             // vote for the next map and mode
+const RESPAWN_MS = 3000, PROTECT_MS = 2000, LEAVE_HURT_MS = 10000;
+const GRACE_S = 25, SHRINK_S = 180, ZONE_DPS = 4;            // last man standing only
+const PUBLIC_MAX = 50, PRIVATE_MAX = 16;
+const MODES = ['tdm', 'ffa', 'lms'];
+const MODE_NAMES = { tdm: 'Team deathmatch', ffa: 'Free for all', lms: 'Last man standing' };
+const TEAM_NAMES = ['Blue', 'Red'];
 const WEAPONS = {
   rifle:  { interval: 60 / 750, body: 20, head: 45, range: 330 },
   pistol: { interval: 60 / 420, body: 24, head: 55, range: 150, falloffAt: 40, falloff: 0.75 },
-  sniper: { interval: 1.25,     body: 85, head: 150, range: 720 },
+  sniper: { interval: 1.6,      body: 85, head: 150, range: 720 },     // one round, then a reload
 };
 const WEAPON_LIST = ['rifle', 'pistol', 'sniper'];
 const SWITCH_LOCK_MS = 900;                                  // client waits 1.0 s; a little slack for lag
@@ -44,6 +53,9 @@ try {
   console.error('Firebase setup failed:', e.message);
 }
 
+const memStats = new Map();   // uid -> stats, used when there's no database (and as a cache)
+const blankStats = () => ({ kills: 0, deaths: 0, wins: 0, matches: 0, headshots: 0 });
+
 async function verifyToken(token) {
   if (DEV_TOKENS && typeof token === 'string' && token.startsWith('dev:')) {
     const [, uid, name, kills] = token.split(':');
@@ -56,13 +68,10 @@ async function verifyToken(token) {
   return { uid: d.uid, email: d.email || '' };
 }
 
-const memStats = new Map();   // uid -> stats, used when there's no database (and as a cache)
-const blankStats = () => ({ kills: 0, deaths: 0, wins: 0, matches: 0, headshots: 0 });
-
 async function loadProfile(who, requestedHead) {
   const fromEmail = String(who.email).split('@')[0];
   let name = who.devName || fromEmail, head = requestedHead === 'fish' ? 'fish' : 'none';
-  let stats = Object.assign(blankStats(), memStats.get(who.uid) || {});
+  const stats = Object.assign(blankStats(), memStats.get(who.uid) || {});
   if (db) {
     try {
       const u = (await db.ref('users/' + who.uid).once('value')).val() || {};
@@ -95,6 +104,8 @@ const vec3 = (a, lim) => Array.isArray(a) ? [clamp(num(a[0]), -lim, lim), clamp(
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 function newCode() { let s = ''; const b = crypto.randomBytes(5); for (let i = 0; i < 5; i++) s += CODE_CHARS[b[i] % CODE_CHARS.length]; return s; }
 function send(p, msg) { if (p.ws.readyState === 1) { try { p.ws.send(typeof msg === 'string' ? msg : JSON.stringify(msg)); } catch (_) {} } }
+function broadcast(room, msg) { const s = JSON.stringify(msg); for (const p of room.players.values()) send(p, s); }
+const pick = list => list[Math.floor(Math.random() * list.length)];
 
 /* ---------- rooms ---------- */
 const rooms = new Map();         // code -> room ('PUBLIC' is the big match)
@@ -102,115 +113,190 @@ const byUid = new Map();         // uid -> player (one connection per account)
 let nextId = 1;
 
 function makeRoom(code, isPublic) {
-  const room = { code, isPublic, max: isPublic ? PUBLIC_MAX : PRIVATE_MAX, players: new Map(),
-    m: { id: 0, phase: 'wait', t: 0, cx: 0, cz: 0, w: '' }, zoneK: 0 };
+  const room = {
+    code, isPublic, max: isPublic ? PUBLIC_MAX : PRIVATE_MAX, players: new Map(),
+    phase: 'wait', t: 0, rid: 0, mode: 'ffa', map: MAPS.MAP_LIST[0], teamKills: [0, 0], cx: 0, cz: 0, zoneK: 0, result: '',
+  };
   rooms.set(code, room);
   return room;
 }
 makeRoom('PUBLIC', true);
+if (DEV_TOKENS && MODES.includes(process.env.START_MODE)) rooms.get('PUBLIC').mode = process.env.START_MODE;   // local tests only
+
+const mapOf = room => MAPS.MAPS[room.map];
+const phaseDur = room => room.phase === 'start' ? START_S : room.phase === 'live' ? ROUND_S : room.phase === 'vote' ? VOTE_S : 0;
+const inRound = (room, p) => room.rid !== 0 && p.part === room.rid;
 
 function zoneOf(room) {
-  const m = room.m;
-  if (m.phase === 'live') room.zoneK = clamp((m.t - GRACE_S) / SHRINK_S, 0, 1);
-  else if (m.phase !== 'over') room.zoneK = 0;
+  const zd = mapOf(room).zone;
+  if (room.mode !== 'lms') return null;
+  if (room.phase === 'live') room.zoneK = clamp((room.t - GRACE_S) / SHRINK_S, 0, 1);
+  else if (room.phase !== 'vote') room.zoneK = 0;
   const k = room.zoneK;
-  return { x: m.cx * k, z: m.cz * k, r: R0 + (R1 - R0) * k, k };
+  return { x: room.cx * k, z: room.cz * k, r: zd.r0 + (zd.r1 - zd.r0) * k, k };
 }
-function randomSpawn() {
-  const a = Math.random() * Math.PI * 2, d = 170 * Math.sqrt(Math.random());
-  const x = Math.cos(a) * d, z = Math.sin(a) * d;
-  return { p: [r2(x), 0, r2(z)], yw: r2(Math.atan2(x, z)) };
+
+// spawn somewhere open, as far as practical from the nearest enemy
+function chooseSpawn(room, p) {
+  const map = mapOf(room);
+  const list = room.mode === 'tdm' && p.team >= 0 ? map.teamSpawns[p.team] : map.spawns;
+  const foes = [...room.players.values()].filter(o => o !== p && o.alive && inRound(room, o) && !(room.mode === 'tdm' && o.team === p.team));
+  const scored = list.map(([x, z]) => {
+    let d = 1e9;
+    for (const o of foes) d = Math.min(d, Math.hypot(o.s.p[0] - x, o.s.p[2] - z));
+    return { x, z, d: d + Math.random() * 6 };
+  }).sort((a, b) => b.d - a.d);
+  return pick(scored.slice(0, Math.min(3, scored.length)));
 }
-function spawn(p, room) {
-  const s = randomSpawn();
-  p.s.p = s.p.slice(); p.s.v = [0, 0, 0]; p.s.yw = s.yw; p.lastPosAt = Date.now();
-  p.hp = 100; p.alive = true; p.zoneAcc = 0; p.kills = 0;
-  send(p, { t: 'spawn', p: s.p, yw: s.yw });
+function spawn(room, p) {
+  const sp = chooseSpawn(room, p);
+  const x = r2(sp.x + (Math.random() - 0.5) * 1.5), z = r2(sp.z + (Math.random() - 0.5) * 1.5);
+  const yw = r2(Math.atan2(x, z));
+  p.s.p = [x, 0, z]; p.s.v = [0, 0, 0]; p.s.yw = yw; p.lastPosAt = Date.now();
+  p.hp = 100; p.alive = true; p.zoneAcc = 0; p.respawnAt = 0; p.protectUntil = Date.now() + PROTECT_MS;
+  send(p, { t: 'spawn', p: p.s.p, yw });
 }
 function aliveIn(room) {
   const out = [];
-  for (const p of room.players.values()) if (p.alive && p.part === room.m.id) out.push(p);
+  for (const p of room.players.values()) if (p.alive && inRound(room, p)) out.push(p);
   return out;
 }
-function startCount(room) {
-  const m = room.m;
-  m.id = 1 + Math.floor(Math.random() * 2e9); m.phase = 'count'; m.t = 0; m.w = '';
-  m.cx = r2((Math.random() - 0.5) * 120); m.cz = r2((Math.random() - 0.5) * 120);
-  room.zoneK = 0;
-  for (const p of room.players.values()) { p.part = m.id; spawn(p, room); }
-}
-function endRound(room) {
-  const m = room.m, alive = aliveIn(room);
-  const winner = alive.length === 1 ? alive[0] : null;
-  for (const p of room.players.values()) if (p.part === m.id) addStats(p.uid, { matches: 1 });
-  if (winner) addStats(winner.uid, { wins: 1 });
-  m.phase = 'over'; m.t = 0; m.w = winner ? winner.name : '';
-  console.log(`${room.code}: round over, ${winner ? winner.name + ' wins' : 'no winner'}`);
+function assignTeam(room, p) {
+  const n = [0, 0];
+  for (const o of room.players.values()) if (o !== p && inRound(room, o) && o.team >= 0) n[o.team]++;
+  p.team = n[0] < n[1] ? 0 : n[1] < n[0] ? 1 : (room.teamKills[0] <= room.teamKills[1] ? 0 : 1);
 }
 
-function kill(room, victim, killer, weapon, head, byZone) {
+function startRound(room) {
+  room.rid = 1 + Math.floor(Math.random() * 2e9);
+  room.phase = 'start'; room.t = 0; room.result = ''; room.teamKills = [0, 0]; room.zoneK = 0;
+  const c = mapOf(room).zone.centre;
+  room.cx = r2((Math.random() - 0.5) * 2 * c); room.cz = r2((Math.random() - 0.5) * 2 * c);
+  const list = [...room.players.values()].sort(() => Math.random() - 0.5);
+  list.forEach((p, i) => {
+    p.part = room.rid; p.kills = 0; p.deaths = 0; p.lastHurtBy = null; p.lastHurtAt = 0;
+    p.team = room.mode === 'tdm' ? i % 2 : -1;
+  });
+  for (const p of list) spawn(room, p);
+  console.log(`${room.code}: ${MODE_NAMES[room.mode]} on ${mapOf(room).name} starting with ${list.length} players`);
+}
+function toWait(room) {
+  room.phase = 'wait'; room.t = 0; room.rid = 0; room.result = '';
+  for (const p of room.players.values()) { p.part = 0; p.team = -1; if (!p.alive) spawn(room, p); }
+}
+
+function endRound(room) {
+  const ps = [...room.players.values()].filter(p => inRound(room, p));
+  let winners = [], text = '';
+  if (room.mode === 'ffa') {
+    const top = Math.max(0, ...ps.map(p => p.kills));
+    const best = ps.filter(p => p.kills === top);
+    if (top > 0 && best.length === 1) { winners = best; text = `${best[0].name} wins with ${top} ${top === 1 ? 'kill' : 'kills'}`; }
+    else text = top > 0 ? `Draw: ${best.map(p => p.name).join(' and ')} tied on ${top} kills` : 'Draw: nobody got a kill';
+  } else if (room.mode === 'tdm') {
+    const [a, b] = room.teamKills;
+    if (a !== b) { const w = a > b ? 0 : 1; winners = ps.filter(p => p.team === w); text = `${TEAM_NAMES[w]} team wins ${Math.max(a, b)} to ${Math.min(a, b)}`; }
+    else text = `Draw: ${a} kills each`;
+  } else {
+    const alive = aliveIn(room);
+    if (alive.length === 1) { winners = alive; text = `${alive[0].name} is the last one standing`; }
+    else text = 'Time ran out: no winner';
+  }
+  for (const p of ps) addStats(p.uid, { matches: 1 });
+  for (const p of winners) addStats(p.uid, { wins: 1 });
+  room.result = text;
+  room.phase = 'vote'; room.t = 0;
+  for (const p of room.players.values()) { p.voteMode = ''; p.voteMap = ''; }
+  console.log(`${room.code}: round over. ${text}`);
+}
+function tally(room) {
+  const mc = Object.fromEntries(MODES.map(m => [m, 0])), pc = Object.fromEntries(MAPS.MAP_LIST.map(m => [m, 0]));
+  for (const p of room.players.values()) { if (p.voteMode in mc) mc[p.voteMode]++; if (p.voteMap in pc) pc[p.voteMap]++; }
+  return { mc, pc };
+}
+function winnerOf(counts, current) {
+  const top = Math.max(...Object.values(counts));
+  if (top === 0) return current;                              // nobody voted: keep what we had
+  return pick(Object.keys(counts).filter(k => counts[k] === top));
+}
+
+function kill(room, victim, killer, weapon, head, byZone, quit) {
   if (!victim.alive) return;
   victim.alive = false; victim.hp = 0;
-  const live = room.m.phase === 'live' && victim.part === room.m.id;
+  const live = room.phase === 'live' && inRound(room, victim);
   if (live) {
+    victim.deaths++;
     addStats(victim.uid, { deaths: 1 });
-    if (killer && killer !== victim) { killer.kills++; addStats(killer.uid, head ? { kills: 1, headshots: 1 } : { kills: 1 }); }
+    if (killer && killer !== victim && inRound(room, killer)) {
+      killer.kills++;
+      if (room.mode === 'tdm' && killer.team >= 0) room.teamKills[killer.team]++;
+      addStats(killer.uid, head ? { kills: 1, headshots: 1 } : { kills: 1 });
+    }
+    if (room.mode !== 'lms') victim.respawnAt = Date.now() + RESPAWN_MS;
   }
-  const place = aliveIn(room).length + 1;
-  console.log(`${room.code}: ${byZone ? 'the zone' : killer ? killer.name : '?'} eliminated ${victim.name}${weapon ? ' (' + weapon + (head ? ', headshot' : '') + ')' : ''}`);
-  const feed = JSON.stringify({ t: 'kill', k: killer ? killer.name : '', v: victim.name, w: weapon || '', hs: head ? 1 : 0, z: byZone ? 1 : 0 });
-  for (const p of room.players.values()) send(p, feed);
-  send(victim, { t: 'died', by: byZone ? 'the zone' : killer ? killer.name : '', place });
+  const place = room.mode === 'lms' ? aliveIn(room).length + 1 : 0;
+  broadcast(room, { t: 'kill', k: killer ? killer.name : '', v: victim.name, w: weapon || '', hs: head ? 1 : 0, z: byZone ? 1 : 0, left: quit ? 1 : 0 });
+  if (!quit) send(victim, { t: 'died', by: byZone ? 'the zone' : killer ? killer.name : '', place, respawn: room.mode !== 'lms' && live ? RESPAWN_MS : 0 });
+  console.log(`${room.code}: ${byZone ? 'the zone' : killer ? killer.name : '?'} eliminated ${victim.name}${weapon ? ' (' + weapon + (head ? ', headshot' : '') + ')' : ''}${quit ? ' (left the match)' : ''}`);
 }
 
 function tickRoom(room, dt) {
-  const m = room.m;
-  m.t += dt;
-  const n = room.players.size;
-  switch (m.phase) {
+  room.t += dt;
+  const n = room.players.size, now = Date.now();
+  switch (room.phase) {
     case 'wait':
-      if (n >= 2) startCount(room);
+      if (n >= 2) startRound(room);
       break;
-    case 'count':
-      if (n < 2) { m.phase = 'wait'; m.t = 0; for (const p of room.players.values()) { p.part = 0; p.alive = true; p.hp = 100; } }
-      else if (m.t >= COUNT_S) { m.phase = 'live'; m.t = 0; }
+    case 'start':
+      if (n < 2) toWait(room);
+      else if (room.t >= START_S) { room.phase = 'live'; room.t = 0; }
       break;
     case 'live': {
-      const alive = aliveIn(room);
-      if (m.t > 1 && alive.length <= 1) { endRound(room); break; }
-      const z = zoneOf(room);
-      for (const p of alive) {
-        if (Math.hypot(p.s.p[0] - z.x, p.s.p[2] - z.z) <= z.r) continue;
-        p.zoneAcc += ZONE_DPS * (z.k >= 1 ? 2.5 : 1) * dt;
-        if (p.zoneAcc >= 1) {
-          const d = Math.floor(p.zoneAcc); p.zoneAcc -= d; p.hp -= d;
-          send(p, { t: 'hurt', a: d, zone: 1 });
-          if (p.hp <= 0) kill(room, p, null, '', false, true);
+      if (room.mode === 'lms') {
+        const alive = aliveIn(room);
+        if ((room.t > 1 && alive.length <= 1) || room.t >= ROUND_S) { endRound(room); break; }
+        const z = zoneOf(room);
+        for (const p of alive) {
+          if (Math.hypot(p.s.p[0] - z.x, p.s.p[2] - z.z) <= z.r) continue;
+          p.zoneAcc += ZONE_DPS * (z.k >= 1 ? 2.5 : 1) * dt;
+          if (p.zoneAcc >= 1) {
+            const d = Math.floor(p.zoneAcc); p.zoneAcc -= d; p.hp -= d;
+            send(p, { t: 'hurt', a: d, zone: 1 });
+            if (p.hp <= 0) kill(room, p, null, '', false, true);
+          }
         }
+      } else {
+        if (n < 2) { console.log(`${room.code}: not enough players, round cancelled`); toWait(room); break; }
+        if (room.t >= ROUND_S) { endRound(room); break; }
+        for (const p of room.players.values()) if (!p.alive && p.respawnAt && now >= p.respawnAt && inRound(room, p)) spawn(room, p);
       }
       break;
     }
-    case 'over':
-      if (m.t >= OVER_S) {
-        if (n >= 2) startCount(room);
-        else { m.phase = 'wait'; m.t = 0; for (const p of room.players.values()) { p.part = 0; p.alive = true; p.hp = 100; } }
+    case 'vote':
+      if (room.t >= VOTE_S) {
+        const { mc, pc } = tally(room);
+        room.mode = winnerOf(mc, room.mode);
+        room.map = winnerOf(pc, room.map);
+        console.log(`${room.code}: vote picked ${MODE_NAMES[room.mode]} on ${mapOf(room).name}`);
+        if (n >= 2) startRound(room); else toWait(room);
       }
       break;
   }
 
-  // snapshot: [id, name, x, y, z, vx, vy, vz, yaw, pitch, flags, weapon, shots, ex, ey, ez, hp, cosmetic, kills]
+  // snapshot: [id, name, x, y, z, vx, vy, vz, yaw, pitch, flags, weapon, shots, ex, ey, ez, hp, cosmetic, kills, team, deaths]
   const ps = [];
   let alive = 0;
   for (const p of room.players.values()) {
-    const s = p.s, inRound = p.part === m.id && m.id !== 0;
-    if (p.alive && inRound) alive++;
-    const flags = (s.g ? 1 : 0) | (s.sp ? 2 : 0) | (s.ad ? 4 : 0) | (s.rl ? 8 : 0) | (p.alive ? 16 : 0) | (inRound ? 32 : 0);
+    const s = p.s, ir = inRound(room, p);
+    if (p.alive && ir) alive++;
+    const flags = (s.g ? 1 : 0) | (s.sp ? 2 : 0) | (s.ad ? 4 : 0) | (s.rl ? 8 : 0) | (p.alive ? 16 : 0) | (ir ? 32 : 0) | (now < p.protectUntil ? 64 : 0);
     ps.push([p.id, p.name, s.p[0], s.p[1], s.p[2], s.v[0], s.v[1], s.v[2], s.yw, s.pt, flags,
-      WEAPON_LIST.indexOf(s.w), p.shots, p.se[0], p.se[1], p.se[2], Math.max(0, Math.ceil(p.hp)), p.cos, p.kills]);
+      WEAPON_LIST.indexOf(s.w), p.shots, p.se[0], p.se[1], p.se[2], Math.max(0, Math.ceil(p.hp)), p.cos, p.kills, p.team, p.deaths]);
   }
-  const msg = JSON.stringify({ t: 's', m: { id: m.id, phase: m.phase, t: r2(m.t), cx: m.cx, cz: m.cz, w: m.w, al: alive, n,
-    code: room.isPublic ? '' : room.code }, ps });
-  for (const p of room.players.values()) send(p, msg);
+  const meta = { rid: room.rid, phase: room.phase, t: r2(room.t), dur: phaseDur(room), mode: room.mode, map: room.map,
+    cx: room.cx, cz: room.cz, res: room.result, al: alive, n, code: room.isPublic ? '' : room.code, tk: room.teamKills };
+  if (room.phase === 'vote') { const { mc, pc } = tally(room); meta.vm = MODES.map(m => mc[m]); meta.vp = MAPS.MAP_LIST.map(m => pc[m]); }
+  broadcast(room, { t: 's', m: meta, ps });
 }
 
 setInterval(() => {
@@ -221,19 +307,29 @@ setInterval(() => {
 function joinRoom(p, room) {
   p.room = room;
   room.players.set(p.id, p);
-  const m = room.m;
-  if (m.phase === 'wait') { p.part = 0; spawn(p, room); }
-  else if (m.phase === 'count') { p.part = m.id; spawn(p, room); }
-  else { p.part = 0; p.alive = false; p.hp = 0; }                           // live or over: watch until the next round
+  p.part = 0; p.team = -1; p.kills = 0; p.deaths = 0;
+  if (room.phase === 'live' && room.mode !== 'lms') {                      // join the round in progress
+    p.part = room.rid;
+    if (room.mode === 'tdm') assignTeam(room, p);
+    spawn(room, p);
+  } else if (room.phase === 'live') {
+    p.alive = false; p.hp = 0;                                             // last man standing: watch until the next round
+    const s = MAPS.MAPS[room.map].spawns[0]; p.s.p = [s[0], 0, s[1]];
+  } else {
+    if (room.phase === 'start') { p.part = room.rid; if (room.mode === 'tdm') assignTeam(room, p); }
+    spawn(room, p);
+  }
 }
 function leaveRoom(p, reason) {
   const room = p.room;
   if (!room) return;
-  if (room.m.phase === 'live' && p.alive && p.part === room.m.id) {
-    addStats(p.uid, { deaths: 1 });                                         // leaving mid-round counts as a death
-    p.alive = false;
-    const feed = JSON.stringify({ t: 'kill', k: '', v: p.name, w: '', hs: 0, z: 0, left: 1 });
-    for (const o of room.players.values()) if (o !== p) send(o, feed);
+  if (room.phase === 'live' && p.alive && inRound(room, p)) {
+    // leaving to dodge a death still counts as one
+    const recent = Date.now() - p.lastHurtAt < LEAVE_HURT_MS;
+    if (room.mode === 'lms' || recent) {
+      const by = recent && p.lastHurtBy && room.players.has(p.lastHurtBy.id) ? p.lastHurtBy : null;
+      kill(room, p, by, '', false, false, true);
+    }
   }
   room.players.delete(p.id);
   p.room = null;
@@ -268,16 +364,17 @@ async function onHello(p, msg) {
   p.cos = prof.head === 'fish' && (prof.stats.kills || 0) >= 10 ? 'fish' : '';
   p.s.w = p.loadout[0]; p.wSince = 0;
   byUid.set(p.uid, p);
+  send(p, { t: 'welcome', id: p.id, name: p.name, cos: p.cos, room: room.isPublic ? '' : room.code, pub: room.isPublic, max: room.max,
+    modes: MODES, maps: MAPS.MAP_LIST, roundS: ROUND_S, voteS: VOTE_S });
   joinRoom(p, room);
-  send(p, { t: 'welcome', id: p.id, name: p.name, cos: p.cos, room: room.isPublic ? '' : room.code, pub: room.isPublic, max: room.max });
   console.log(`${p.name} joined ${room.code} (${room.players.size} players)`);
 }
 
 function onUpdate(p, msg) {
-  const s = p.s, now = Date.now();
-  const pos = vec3(msg.p, MAP_HALF + 5);
+  const s = p.s, now = Date.now(), half = mapOf(p.room).half;
+  const pos = vec3(msg.p, half + 2);
   if (pos) {
-    pos[1] = clamp(pos[1], 0, 30);
+    pos[1] = clamp(pos[1], 0, 12);
     const dtS = Math.max(0.02, (now - (p.lastPosAt || now)) / 1000);
     const moved = Math.hypot(pos[0] - s.p[0], pos[2] - s.p[2]);
     if (moved <= 9.5 * dtS + 1.5 || !p.alive || DEV_TOKENS) { s.p = pos; p.lastPosAt = now; }   // speed limit (off for local tests)
@@ -296,11 +393,13 @@ function onShot(p, msg) {
   if (now - p.lastShot < w.interval * 1000 * 0.8) return;                  // faster than the gun can fire
   p.lastShot = now;
   p.shots++;
+  p.protectUntil = 0;                                                      // shooting ends spawn protection
   const se = vec3(msg.se, 3000); if (se) p.se = se.map(r2);
 
   const target = msg.hit ? room.players.get(Number(msg.hit)) : null;
-  const m = room.m;
-  if (!target || target === p || !target.alive || m.phase !== 'live' || p.part !== m.id || target.part !== m.id) return;
+  if (!target || target === p || !target.alive || room.phase !== 'live' || !inRound(room, p) || !inRound(room, target)) return;
+  if (room.mode === 'tdm' && target.team === p.team) return;              // no friendly fire
+  if (now < target.protectUntil) return;
   const ex = p.s.p[0], ey = p.s.p[1] + 1.65, ez = p.s.p[2];
   const tx = target.s.p[0], ty = target.s.p[1] + 1.0, tz = target.s.p[2];
   const dist = Math.hypot(tx - ex, ty - ey, tz - ez);
@@ -309,17 +408,27 @@ function onShot(p, msg) {
   const cy = Math.cos(p.s.pt);
   const ax = -Math.sin(p.s.yw) * cy, ay = Math.sin(p.s.pt), az = -Math.cos(p.s.yw) * cy;
   const dot = (ax * (tx - ex) + ay * (ty - ey) + az * (tz - ez)) / Math.max(dist, 0.01);
-  const angle = Math.acos(clamp(dot, -1, 1));
-  if (angle > 0.4 + Math.atan(1.4 / Math.max(dist, 0.5))) return;
+  if (Math.acos(clamp(dot, -1, 1)) > 0.4 + Math.atan(1.4 / Math.max(dist, 0.5))) return;
+  // and no wall in the way of both the body and the head
+  const map = mapOf(room);
+  if (MAPS.blocked(map, ex, ey, ez, tx, ty, tz) && MAPS.blocked(map, ex, ey, ez, tx, target.s.p[1] + 1.65, tz)) return;
 
   const head = !!msg.hd;
   let dmg = head ? w.head : w.body;
   if (w.falloffAt && dist > w.falloffAt) dmg = Math.round(dmg * w.falloff);
   target.hp -= dmg;
+  target.lastHurtBy = p; target.lastHurtAt = now;
   const killed = target.hp <= 0;
   send(p, { t: 'hit', hd: head ? 1 : 0, k: killed ? 1 : 0 });
   send(target, { t: 'hurt', a: dmg, x: r2(ex), z: r2(ez) });
   if (killed) kill(room, target, p, p.s.w, head, false);
+}
+
+function onVote(p, msg) {
+  const room = p.room;
+  if (!room || room.phase !== 'vote') return;
+  if (MODES.includes(msg.mode)) p.voteMode = msg.mode;
+  if (MAPS.MAP_LIST.includes(msg.map)) p.voteMap = msg.map;
 }
 
 /* ---------- server ---------- */
@@ -328,14 +437,16 @@ const server = http.createServer((req, res) => {
   let players = 0; for (const r of rooms.values()) players += r.players.size;
   res.writeHead(200, { 'content-type': 'text/plain', 'access-control-allow-origin': '*' });
   if (DEV_TOKENS && req.url === '/stats') { res.end(JSON.stringify(Object.fromEntries(memStats))); return; }
-  res.end(`Baseplate FPS game server is running. ${players} playing right now.\n`);
+  const pub = rooms.get('PUBLIC');
+  res.end(`Baseplate FPS game server is running. ${players} playing right now. Public match: ${MODE_NAMES[pub.mode]} on ${mapOf(pub).name} (${pub.phase}).\n`);
 });
 const wss = new WebSocketServer({ server, maxPayload: 8 * 1024 });
 
 wss.on('connection', ws => {
   const p = { id: nextId++, ws, uid: '', name: '', authed: false, room: null, loadout: WEAPON_LIST.slice(), cos: '',
     s: { p: [0, 0, 0], v: [0, 0, 0], yw: 0, pt: 0, g: true, sp: false, ad: false, rl: false, w: 'rifle' },
-    hp: 100, alive: true, part: 0, kills: 0, shots: 0, se: [0, 0, 0], lastShot: 0, wSince: 0, zoneAcc: 0,
+    hp: 100, alive: true, part: 0, team: -1, kills: 0, deaths: 0, shots: 0, se: [0, 0, 0], lastShot: 0, wSince: 0, zoneAcc: 0,
+    respawnAt: 0, protectUntil: 0, lastHurtBy: null, lastHurtAt: 0, voteMode: '', voteMap: '',
     lastPosAt: 0, lastFixAt: 0, msgs: 0, msgWindow: Date.now() };
   const helloTimer = setTimeout(() => { if (!p.authed) ws.close(); }, 15000);
   ws.on('pong', () => { ws._bpMissed = false; });
@@ -346,8 +457,10 @@ wss.on('connection', ws => {
     let msg; try { msg = JSON.parse(raw); } catch (_) { return; }
     if (!msg || typeof msg !== 'object') return;
     if (!p.authed) { if (msg.t === 'hello' && !p.helloSeen) { p.helloSeen = true; onHello(p, msg).catch(e => { console.error(e); ws.close(); }); } return; }
+    if (!p.room) return;
     if (msg.t === 'u') onUpdate(p, msg);
     else if (msg.t === 'f') onShot(p, msg);
+    else if (msg.t === 'vote') onVote(p, msg);
     else if (msg.t === 'leave') { leaveRoom(p, 'left'); ws.close(); }
   });
   ws.on('close', () => { clearTimeout(helloTimer); if (p.room) leaveRoom(p, 'disconnected'); });
