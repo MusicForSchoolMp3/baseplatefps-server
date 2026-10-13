@@ -1,0 +1,17 @@
+{
+  "name": "baseplatefps-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Game server for Baseplate FPS",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "firebase-admin": "13.6.0",
+    "ws": "8.18.3"
+  }
+}
