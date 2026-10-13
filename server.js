@@ -14,7 +14,7 @@ const PORT = Number(process.env.PORT) || 8080;
 const PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'baseplatefps-e1fc1';
 const DATABASE_URL = process.env.FIREBASE_DATABASE_URL || 'https://baseplatefps-e1fc1-default-rtdb.asia-southeast1.firebasedatabase.app';
 const DEV_TOKENS = process.env.DEV_TOKENS === '1';           // local testing only, never set this on Render
-const PROTO = 3;
+const PROTO = 4;
 const EMAIL_DOMAIN = 'players.baseplatefps.game';
 const USER_RE = /^[A-Za-z0-9]{3,20}$/;
 
@@ -36,6 +36,10 @@ const WEAPONS = {
 const WEAPON_LIST = ['rifle', 'pistol', 'sniper'];
 const SWITCH_LOCK_MS = 900;                                  // client waits 1.0 s; a little slack for lag
 const RELOAD_SLACK_MS = 250;                                 // allow for lag before a reload is "done"
+const RELOAD_REFILL = 1.44 / 2.1;                            // the client's fresh mag goes in this far through the reload
+const SHOT_BURST = 2.5;                                      // shots that may arrive bunched together by network jitter
+const HIST_MS = 800;                                         // how far back a shooter's view of a target may lag
+const HIST_TOL = 1.0;                                        // metres the shooter's view may stray from the target's real path
 
 /* ---------- Firebase ---------- */
 let admin = null, db = null;
@@ -180,6 +184,7 @@ function spawn(room, p) {
   p.hp = 100; p.alive = true; p.zoneAcc = 0; p.respawnAt = 0; p.protectUntil = Date.now() + PROTECT_MS;
   for (const id of WEAPON_LIST) p.ammo[id] = WEAPONS[id].mag;
   p.reloadUntil = 0;
+  p.hist = [{ t: Date.now(), x, y: 0, z, vx: 0, vy: 0, vz: 0 }];          // a fresh life: no shooting at where they died
   send(p, { t: 'spawn', p: p.s.p, yw });
 }
 function aliveIn(room) {
@@ -415,9 +420,18 @@ function onUpdate(p, msg) {
     } else { s.p = pos; p.lastPosAt = now; }
   }
   const v = vec3(msg.v, 40); if (v) s.v = v;
+  // where this player has been lately, so shots can be checked against what the shooter actually saw
+  const h = p.hist;
+  h.push({ t: now, x: s.p[0], y: s.p[1], z: s.p[2], vx: s.v[0], vy: s.v[1], vz: s.v[2] });
+  while (h.length > 2 && now - h[1].t > HIST_MS) h.shift();
+  if (h.length > 40) h.splice(0, h.length - 40);
   s.yw = num(msg.yw, s.yw); s.pt = clamp(num(msg.pt, s.pt), -1.6, 1.6);
   s.g = !!msg.g; s.sp = !!msg.sp; s.ad = !!msg.ad; s.rl = !!msg.rl;
-  if (typeof msg.w === 'string' && msg.w !== s.w && p.loadout.includes(msg.w)) { s.w = msg.w; p.wSince = now; p.reloadUntil = 0; }   // switching cancels a reload, like on the client
+  if (typeof msg.w === 'string' && msg.w !== s.w && p.loadout.includes(msg.w)) {
+    // switching cancels a reload, like on the client; if the new mag was already in, the client kept it
+    if (p.reloadUntil && p.reloadWeapon === s.w && now >= p.reloadStart + RELOAD_REFILL * WEAPONS[s.w].reload - 120) p.ammo[s.w] = WEAPONS[s.w].mag;
+    s.w = msg.w; p.wSince = now; p.reloadUntil = 0;
+  }
 }
 
 function refreshAmmo(p, now) {                                            // a reload finishes lazily, when it next matters
@@ -425,7 +439,7 @@ function refreshAmmo(p, now) {                                            // a r
 }
 function startReload(p, now) {
   if (p.reloadUntil || !WEAPONS[p.s.w]) return;
-  p.reloadWeapon = p.s.w; p.reloadUntil = now + WEAPONS[p.s.w].reload;
+  p.reloadWeapon = p.s.w; p.reloadStart = now; p.reloadUntil = now + WEAPONS[p.s.w].reload;
 }
 function onReload(p) {
   const now = Date.now(), w = WEAPONS[p.s.w];
@@ -434,14 +448,60 @@ function onReload(p) {
   if (!p.reloadUntil && p.ammo[p.s.w] < w.mag) startReload(p, now);
 }
 
+/* --- hit checks. The shooter sees everyone slightly in the past (their ping plus the snapshot rate), so a shot is
+   tested against where the target was drawn on the shooter's screen. That spot has to lie on the path the target
+   really took over the last HIST_MS, so nobody can hit a target that was never there. --- */
+function segDist(px, py, pz, ax, ay, az, bx, by, bz) {
+  const dx = bx - ax, dy = by - ay, dz = bz - az, l2 = dx * dx + dy * dy + dz * dz;
+  const u = l2 > 1e-9 ? clamp(((px - ax) * dx + (py - ay) * dy + (pz - az) * dz) / l2, 0, 1) : 0;
+  return Math.hypot(px - (ax + dx * u), py - (ay + dy * u), pz - (az + dz * u));
+}
+function onTargetPath(target, x, y, z, now) {
+  const h = target.hist || [], s = target.s;
+  const pts = h.filter(e => now - e.t <= HIST_MS + 100);
+  pts.push({ x: s.p[0], y: s.p[1], z: s.p[2], vx: s.v[0], vy: s.v[1], vz: s.v[2] });
+  let best = Infinity;
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i];
+    // the shooter's client runs a target ahead along its velocity for up to 0.25 s between snapshots
+    best = Math.min(best, segDist(x, y, z, a.x, a.y, a.z, a.x + a.vx * 0.25, Math.max(0, a.y + a.vy * 0.25), a.z + a.vz * 0.25));
+    if (i > 0) { const b = pts[i - 1]; best = Math.min(best, segDist(x, y, z, b.x, b.y, b.z, a.x, a.y, a.z)); }
+  }
+  return best <= HIST_TOL;
+}
+function raySphere(ox, oy, oz, dx, dy, dz, cx, cy, cz, R) {
+  const ax = ox - cx, ay = oy - cy, az = oz - cz;
+  const b = ax * dx + ay * dy + az * dz, c = ax * ax + ay * ay + az * az - R * R, disc = b * b - c;
+  if (disc < 0) return -1;
+  const sq = Math.sqrt(disc);
+  let t = -b - sq; if (t < 0) t = -b + sq;
+  return t >= 0 ? t : -1;
+}
+function rayCapsule(ox, oy, oz, dx, dy, dz, x, y0, y1, z, R) {           // an upright capsule from y0 to y1
+  const L = y1 - y0, bx = ox - x, by = oy - y0, bz = oz - z;
+  const b = dy * L, c = L * L, dd = dx * bx + dy * by + dz * bz, e = L * by, den = c - b * b;
+  let s = den > 1e-8 ? clamp((e - b * dd) / den, 0, 1) : 0;
+  let t = b * s - dd;
+  if (t < 0) { t = 0; s = clamp(e / c, 0, 1); }
+  const qx = ox + dx * t - x, qy = oy + dy * t - (y0 + L * s), qz = oz + dz * t - z;
+  const d2 = qx * qx + qy * qy + qz * qz;
+  if (d2 > R * R) return -1;
+  const hit = t - Math.sqrt(R * R - d2);
+  return hit >= 0 ? hit : -1;
+}
+
 function onShot(p, msg) {
   const room = p.room, now = Date.now(), wid = p.s.w, w = WEAPONS[wid];
   if (!room || !w || !p.alive || msg.w !== wid) return;
   if (now - p.wSince < SWITCH_LOCK_MS) return;                             // just switched weapons
   refreshAmmo(p, now);
   if (p.reloadUntil && now < p.reloadUntil - RELOAD_SLACK_MS) return;      // still reloading
-  if (now - p.lastShot < w.interval * 1000 * 0.8) return;                  // faster than the gun can fire
+  // fire rate: a small bucket of shots that refills at the gun's rate, so jitter-bunched packets still count
+  p.shotCredit = Math.min(SHOT_BURST, p.shotCredit + (now - p.creditAt) / (w.interval * 1000 * 0.92));
+  p.creditAt = now;
+  if (p.shotCredit < 0.95) return;                                         // faster than the gun can fire
   if (p.ammo[wid] <= 0) { startReload(p, now); return; }                   // out of ammo: no free shots
+  p.shotCredit -= 1;
   p.ammo[wid]--;
   if (p.ammo[wid] <= 0) startReload(p, now);
   p.lastShot = now;
@@ -453,29 +513,35 @@ function onShot(p, msg) {
   if (!target || target === p || !target.alive || room.phase !== 'live' || !inRound(room, p) || !inRound(room, target)) return;
   if (room.mode === 'tdm' && target.team === p.team) return;              // no friendly fire
   if (now < target.protectUntil) return;
-  const ex = p.s.p[0], ey = p.s.p[1] + 1.65, ez = p.s.p[2];
-  const feet = target.s.p[1], tx = target.s.p[0], tz = target.s.p[2];
-  const cy = Math.cos(p.s.pt);
-  const ax = -Math.sin(p.s.yw) * cy, ay = Math.sin(p.s.pt), az = -Math.cos(p.s.yw) * cy;   // the shooter's own aim
-  // how far along the aim ray the shot passes the target, and where on the target it lands
-  const th = ((tx - ex) * ax + (tz - ez) * az) / Math.max(ax * ax + az * az, 1e-4);
-  if (th <= 0 || th > w.range + 4) return;
-  const px = ex + ax * th, py = ey + ay * th, pz = ez + az * th;
-  const horiz = Math.hypot(px - tx, pz - tz), rise = py - feet;
-  if (horiz > 0.4 || rise < -0.1 || rise > 1.9) return;                  // the aim isn't actually on the body: no hit (kills aimbot-less wallbangs/fake hits)
+  const map = mapOf(room), half = map.half + 2;
+  const o = vec3(msg.o, half + 20), d = vec3(msg.d, 2), tp = vec3(msg.tp, half + 20);
+  if (!o || !d || !tp) return;
+  // the shot has to start at the shooter's own eyes
+  if (Math.hypot(o[0] - p.s.p[0], o[2] - p.s.p[2]) > 2 || Math.abs(o[1] - (p.s.p[1] + 1.65)) > 1.3) return;
+  const dl = Math.hypot(d[0], d[1], d[2]); if (dl < 0.5) return;
+  const dx = d[0] / dl, dy = d[1] / dl, dz = d[2] / dl;
+  // ...roughly the way they were looking (a generous cone: flicks happen between updates)
+  const cp = Math.cos(p.s.pt);
+  if (dx * -Math.sin(p.s.yw) * cp + dy * Math.sin(p.s.pt) + dz * -Math.cos(p.s.yw) * cp < 0.35) return;
+  // ...at a target drawn where it really was a moment ago
+  if (!onTargetPath(target, tp[0], tp[1], tp[2], now)) return;
+  // ...and actually pass through the body there (same shapes the client tests, a hair bigger)
+  const tHead = raySphere(o[0], o[1], o[2], dx, dy, dz, tp[0], tp[1] + 1.66, tp[2], 0.18);
+  const tBody = rayCapsule(o[0], o[1], o[2], dx, dy, dz, tp[0], tp[1] + 0.12, tp[1] + 1.42, tp[2], 0.3);
+  if (tHead < 0 && tBody < 0) return;
+  const head = tHead >= 0 && (tBody < 0 || tHead <= tBody + 0.05);         // the server decides headshots, not the client
+  const dist = head ? tHead : tBody;
+  if (dist > w.range + 4) return;
   // no wall between the shooter and where the shot lands
-  const map = mapOf(room);
-  if (MAPS.blocked(map, ex, ey, ez, px, py, pz)) return;
-  const head = rise >= 1.5 && horiz <= 0.2;                              // the server decides headshots, not the client
+  if (MAPS.blocked(map, o[0], o[1], o[2], o[0] + dx * dist, o[1] + dy * dist, o[2] + dz * dist)) return;
 
-  const dist = Math.hypot(tx - ex, feet + 1 - ey, tz - ez);
   let dmg = head ? w.head : w.body;
   if (w.falloffAt && dist > w.falloffAt) dmg = Math.round(dmg * w.falloff);
   target.hp -= dmg;
   target.lastHurtBy = p; target.lastHurtAt = now;
   const killed = target.hp <= 0;
-  send(p, { t: 'hit', hd: head ? 1 : 0, k: killed ? 1 : 0 });
-  send(target, { t: 'hurt', a: dmg, x: r2(ex), z: r2(ez) });
+  send(p, { t: 'hit', id: target.id, hd: head ? 1 : 0, k: killed ? 1 : 0 });
+  send(target, { t: 'hurt', a: dmg, x: r2(o[0]), z: r2(o[2]) });
   if (killed) kill(room, target, p, wid, head, false);
 }
 
@@ -503,7 +569,8 @@ wss.on('connection', ws => {
     s: { p: [0, 0, 0], v: [0, 0, 0], yw: 0, pt: 0, g: true, sp: false, ad: false, rl: false, w: 'rifle' },
     hp: 100, alive: true, part: 0, team: -1, kills: 0, deaths: 0, shots: 0, se: [0, 0, 0], lastShot: 0, wSince: 0, zoneAcc: 0,
     respawnAt: 0, protectUntil: 0, lastHurtBy: null, lastHurtAt: 0, voteMode: '', voteMap: '',
-    ammo: { rifle: 30, pistol: 12, sniper: 1 }, reloadUntil: 0, reloadWeapon: '',
+    ammo: { rifle: 30, pistol: 12, sniper: 1 }, reloadUntil: 0, reloadStart: 0, reloadWeapon: '',
+    hist: [], shotCredit: SHOT_BURST, creditAt: 0,
     lastPosAt: 0, lastFixAt: 0, msgs: 0, msgWindow: Date.now() };
   const helloTimer = setTimeout(() => { if (!p.authed) ws.close(); }, 15000);
   ws.on('pong', () => { ws._bpMissed = false; });
