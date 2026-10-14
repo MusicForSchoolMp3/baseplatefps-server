@@ -9,6 +9,7 @@ const http = require('http');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 const MAPS = require('./maps.js');
+const COS = require('./cosmetics.js');
 
 const PORT = Number(process.env.PORT) || 8080;
 const PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'baseplatefps-e1fc1';
@@ -59,7 +60,7 @@ try {
 }
 
 const memStats = new Map();   // uid -> stats, used when there's no database (and as a cache)
-const blankStats = () => ({ kills: 0, deaths: 0, wins: 0, matches: 0, headshots: 0 });
+const blankStats = () => Object.fromEntries(COS.STATS.map(k => [k, 0]));
 
 async function verifyToken(token) {
   if (DEV_TOKENS && typeof token === 'string' && token.startsWith('dev:')) {
@@ -76,22 +77,26 @@ async function verifyToken(token) {
 const modRec = new Map();     // uid -> { banned, tamperAt } — cheater warnings and bans, server-only
 const TAMPER_BAN_MS = (Number(process.env.TAMPER_BAN_S) || 5 * 60 * 60) * 1000;   // a second DevTools open within 5 hours is a ban
 
-async function loadProfile(who, requestedHead) {
+async function loadProfile(who, requested) {
   const fromEmail = String(who.email).split('@')[0];
-  let name = who.devName || fromEmail, head = requestedHead === 'fish' ? 'fish' : 'none';
+  let name = who.devName || fromEmail;
+  const pickSlots = a => Object.fromEntries(COS.SLOTS.map(sl => [sl, a && typeof a[sl] === 'string' && COS.item(sl, a[sl]) ? a[sl] : 'none']));
+  let avatar = pickSlots(db ? null : requested);   // with a database, only what's saved there counts
   const stats = Object.assign(blankStats(), memStats.get(who.uid) || {});
   if (db) {
     try {
       const u = (await db.ref('users/' + who.uid).once('value')).val() || {};
       if (typeof u.username === 'string' && u.username.toLowerCase() === fromEmail) name = u.username;
-      if (u.avatar && typeof u.avatar.head === 'string') head = u.avatar.head === 'fish' ? 'fish' : 'none';
+      if (u.avatar && typeof u.avatar === 'object') avatar = pickSlots(u.avatar);
       if (u.stats && typeof u.stats === 'object') for (const k of Object.keys(blankStats())) stats[k] = Number(u.stats[k]) || 0;
       if (u.mod && typeof u.mod === 'object' && !modRec.has(who.uid)) modRec.set(who.uid, { banned: !!u.mod.banned, tamperAt: Number(u.mod.tamperAt) || 0 });
     } catch (e) { console.warn('Could not read profile', who.uid, e.message); }
   }
   memStats.set(who.uid, stats);
   if (!USER_RE.test(name)) name = (fromEmail.replace(/[^A-Za-z0-9]/g, '').slice(0, 20)) || 'Player';
-  return { name, stats, head, banned: (modRec.get(who.uid) || {}).banned };
+  // the owner list is matched against the verified sign-in email, so nobody can claim it from their browser
+  const owner = String(who.email).toLowerCase() === fromEmail.toLowerCase() + '@' + EMAIL_DOMAIN && COS.isOwner(fromEmail);
+  return { name, stats, avatar, owner, banned: (modRec.get(who.uid) || {}).banned };
 }
 
 function onTamper(p) {
@@ -113,6 +118,12 @@ function banPlayer(p, rec) {
   setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 400);
 }
 
+function bestStreak(uid, n) {                                       // a record, not a running total
+  const s = memStats.get(uid) || blankStats();
+  if (n <= (s.bestStreak || 0)) return;
+  s.bestStreak = n; memStats.set(uid, s);
+  if (db) db.ref('users/' + uid + '/stats/bestStreak').transaction(v => Math.max(Number(v) || 0, n)).catch(e => console.warn('Streak not saved for', uid, e.message));
+}
 function addStats(uid, delta) {
   const s = memStats.get(uid) || blankStats();
   for (const k of Object.keys(delta)) s[k] = (s[k] || 0) + delta[k];
@@ -150,6 +161,7 @@ function makeRoom(code, isPublic) {
 }
 makeRoom('PUBLIC', true);
 if (DEV_TOKENS && MODES.includes(process.env.START_MODE)) rooms.get('PUBLIC').mode = process.env.START_MODE;   // local tests only
+if (DEV_TOKENS && MAPS.MAPS[process.env.START_MAP]) rooms.get('PUBLIC').map = process.env.START_MAP;
 
 const mapOf = room => MAPS.MAPS[room.map];
 const phaseDur = room => room.phase === 'start' ? START_S : room.phase === 'live' ? ROUND_S : room.phase === 'vote' ? VOTE_S : 0;
@@ -205,7 +217,7 @@ function startRound(room) {
   room.cx = r2((Math.random() - 0.5) * 2 * c); room.cz = r2((Math.random() - 0.5) * 2 * c);
   const list = [...room.players.values()].sort(() => Math.random() - 0.5);
   list.forEach((p, i) => {
-    p.part = room.rid; p.kills = 0; p.deaths = 0; p.lastHurtBy = null; p.lastHurtAt = 0;
+    p.part = room.rid; p.kills = 0; p.deaths = 0; p.streak = 0; p.lastHurtBy = null; p.lastHurtAt = 0;
     p.team = room.mode === 'tdm' ? i % 2 : -1;
   });
   for (const p of list) spawn(room, p);
@@ -261,8 +273,14 @@ function kill(room, victim, killer, weapon, head, byZone, quit) {
     if (killer && killer !== victim && inRound(room, killer)) {
       killer.kills++;
       if (room.mode === 'tdm' && killer.team >= 0) room.teamKills[killer.team]++;
-      addStats(killer.uid, head ? { kills: 1, headshots: 1 } : { kills: 1 });
+      const add = { kills: 1 };
+      if (head) add.headshots = 1;
+      if (WEAPONS[weapon]) add[weapon + 'Kills'] = 1;
+      addStats(killer.uid, add);
+      killer.streak = (killer.streak || 0) + 1;
+      bestStreak(killer.uid, killer.streak);
     }
+    victim.streak = 0;
     if (room.mode !== 'lms') victim.respawnAt = Date.now() + RESPAWN_MS;
   }
   const place = room.mode === 'lms' ? aliveIn(room).length + 1 : 0;
@@ -393,7 +411,8 @@ async function onHello(p, msg) {
   const lo = String(msg.loadout || '').split(',');
   p.loadout = lo.length === 3 && WEAPON_LIST.every(w => lo.includes(w)) ? lo : WEAPON_LIST.slice();
   p.uid = who.uid; p.name = prof.name; p.authed = true;
-  p.cos = prof.head === 'fish' && (prof.stats.kills || 0) >= 10 ? 'fish' : '';
+  // only items this account has really unlocked are shown to anyone
+  p.cos = COS.SLOTS.map(sl => COS.unlocked(sl, prof.avatar[sl], prof.stats, prof.owner) && prof.avatar[sl] !== 'none' ? prof.avatar[sl] : '').join('|');
   p.s.w = p.loadout[0]; p.wSince = 0;
   byUid.set(p.uid, p);
   send(p, { t: 'welcome', id: p.id, name: p.name, cos: p.cos, room: room.isPublic ? '' : room.code, pub: room.isPublic, max: room.max,

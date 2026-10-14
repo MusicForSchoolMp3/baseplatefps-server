@@ -138,7 +138,226 @@
     };
   }
 
-  const MAPS = { outpost: outpost() };
+
+  /* ---------- Manor: a grand old house at golden hour, with hedge mazes, a fountain courtyard and a pond ---------- */
+  // a straight wall from a0 to a1 along one axis, with openings (doors and windows) cut out of it
+  function wallWith(box, axis, fixed, a0, a1, T, H, k, holes) {
+    const cuts = [a0, a1];
+    for (const h of holes) cuts.push(h[0] - h[1] / 2, h[0] + h[1] / 2);
+    const xs = [...new Set(cuts.map(v => Math.round(v * 1000) / 1000))].filter(v => v >= a0 && v <= a1).sort((p, q) => p - q);
+    let run = null;
+    const flush = () => {
+      if (!run) return;
+      for (const [y0, y1] of run.ys) {
+        const c = (run.s + run.e) / 2, len = run.e - run.s;
+        if (axis === 'x') box(c, fixed, len, T, y1 - y0, k, y0); else box(fixed, c, T, len, y1 - y0, k, y0);
+      }
+      run = null;
+    };
+    for (let i = 0; i < xs.length - 1; i++) {
+      const s = xs[i], e = xs[i + 1], mid = (s + e) / 2;
+      let ys = [[0, H]];
+      for (const h of holes) if (mid > h[0] - h[1] / 2 && mid < h[0] + h[1] / 2) {
+        const out = [];
+        for (const [y0, y1] of ys) { if (h[2] > y0) out.push([y0, Math.min(y1, h[2])]); if (h[3] < y1) out.push([Math.max(y0, h[3]), y1]); }
+        ys = out.filter(r => r[1] - r[0] > 0.01);
+      }
+      const key = JSON.stringify(ys);
+      if (run && run.key === key) run.e = e; else { flush(); run = { s, e, ys, key }; }
+    }
+    flush();
+  }
+  function manor() {
+    const { boxes, box } = makeBuilder();
+    const H = 70;
+    let seed = 20240611;
+    const rnd = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
+
+    // perimeter: a stone garden wall with pillars, and an iron gate at the south
+    box(0, -H - 0.5, 2 * H + 2, 1, 3.2, 'stone'); box(0, H + 0.5, 2 * H + 2, 1, 3.2, 'stone');
+    box(-H - 0.5, 0, 1, 2 * H, 3.2, 'stone'); box(H + 0.5, 0, 1, 2 * H, 3.2, 'stone');
+    for (let v = -H; v <= H; v += 14) for (const [x, z] of [[v, -H - 0.5], [v, H + 0.5], [-H - 0.5, v], [H + 0.5, v]]) box(x, z, 1.5, 1.5, 3.8, 'stone');
+
+    /* the house: 36 x 24 m, two floors. Ground floor 0-3.6 m, upper floor at 4 m, roof at 7.4 m */
+    const X = 18, ZF = 6, ZB = -18, T = 0.4, TOP = 7.4, F2 = 4, SLAB = 3.6;
+    const door = (c, w = 1.8) => [c, w, 0, 2.7], win = (c, w = 1.6) => [c, w, 1.0, 2.6];
+    const updoor = (c, w = 1.6) => [c, w, F2, F2 + 2.5], upwin = (c, w = 1.6) => [c, w, F2 + 1.0, F2 + 2.6];
+    wallWith(box, 'x', ZF, -X, X, T, TOP, 'brick', [door(0, 3.2), win(-15), win(-9), win(9), win(15), upwin(-15), updoor(-11), upwin(-3), upwin(3), updoor(11), upwin(15)]);
+    wallWith(box, 'x', ZB, -X, X, T, TOP, 'brick', [door(0, 3.2), win(-14), win(-9), win(9), win(14), upwin(-14), upwin(-9), upwin(-3), upwin(3), upwin(9), upwin(14)]);
+    for (const s of [-1, 1]) wallWith(box, 'z', s * X, ZB, ZF, T, TOP, 'brick', [door(-2.5, 2.4), win(2.5), win(-13), upwin(2.5), upwin(-2.5), upwin(-13)]);
+    // the grand hall in the middle: double height at the front, a gallery over the back half
+    for (const s of [-1, 1]) wallWith(box, 'z', s * 6, ZB, ZF, T, TOP, 'plaster', [door(0, 1.8), door(-12, 1.8), [0, 2.4, F2 + 1.0, F2 + 2.4], updoor(-12)]);
+    // the wings: a cross wall on each floor splits front and back rooms
+    for (const s of [-1, 1]) wallWith(box, 'x', -6, s > 0 ? 6 : -X, s > 0 ? X : -6, T, TOP, 'plaster', [door(s * 12, 1.8), updoor(s * 12, 1.8)]);
+    // upper floors: both wings, and the gallery over the back of the hall
+    box(-12, -6, 12, 24, 0.4, 'floor', SLAB); box(12, -6, 12, 24, 0.4, 'floor', SLAB);
+    box(0, -12, 12, 12, 0.4, 'floor', SLAB);
+    box(0, -6.1, 8.2, 0.15, 1.0, 'railing', F2);                                  // gallery railing between the stairs
+    box(0, -6, 2 * X + 0.6, 2 * (ZF - ZB) / 2 + 0.6, 0.4, 'slate', TOP);          // roof
+    box(0, -6, 2 * X + 1.4, 2 * (ZF - ZB) / 2 + 1.4, 0.25, 'slate', TOP + 0.4);
+    box(0, -6, 2 * X - 4, 2 * (ZF - ZB) / 2 - 4, 0.6, 'slate', TOP + 0.65);
+    for (const s of [-1, 1]) for (const z of [-14, 2]) box(s * 13, z, 1.2, 1.2, 2.2, 'brick', TOP + 1.25);   // chimneys
+    // twin staircases up the sides of the hall, climbing from the front to the gallery
+    for (const s of [-1, 1]) for (let k = 1; k <= 16; k++) box(s * 5, 0.4 - (k - 0.5) * 0.4, 1.6, 0.4, k * 0.25, 'floor');
+    box(-3, -1, 0.9, 0.9, SLAB, 'marble'); box(3, -1, 0.9, 0.9, SLAB, 'marble');   // pillars under the gallery edge
+    box(0, -12, 3, 1.4, 0.8, 'furniture');                                           // a long table under the gallery
+    // ground floor, west: dining room (front) and kitchen (back)
+    box(-12, 0.5, 6, 1.6, 0.8, 'furniture'); box(-17.4, 3, 0.7, 4, 1.0, 'furniture');
+    for (const x of [-14.2, -12, -9.8]) for (const z of [-0.8, 1.8]) box(x, z, 0.55, 0.55, 1.0, 'fabric');
+    box(-17.45, -12, 0.7, 9, 0.95, 'counter'); box(-12, -17.45, 9, 0.7, 0.95, 'counter'); box(-12, -11, 3, 1.3, 0.95, 'counter');
+    // ground floor, east: library (front) and lounge with a fireplace (back)
+    box(17.5, 2.6, 0.6, 4.8, 2.8, 'books'); box(12, 5.5, 7, 0.6, 2.8, 'books'); box(10, -1.5, 0.6, 4, 2.0, 'books'); box(14, -1.5, 0.6, 4, 2.0, 'books');
+    box(12, 2.2, 1.8, 1.0, 0.8, 'furniture');
+    box(17.4, -12, 0.8, 2.4, 1.6, 'stone'); box(12, -9.5, 3, 0.9, 0.8, 'fabric'); box(12, -14.5, 3, 0.9, 0.8, 'fabric'); box(8.8, -12, 1.4, 1.4, 1.0, 'furniture');
+    // upper floor: bedrooms at the front (with balconies), a study and an attic room at the back
+    for (const s of [-1, 1]) {
+      box(s * 13.5, 3, 2.2, 2.4, 0.6, 'fabric', F2); box(s * 13.5, 4.35, 2.4, 0.3, 1.4, 'furniture', F2);
+      box(s * 17.5, -2.5, 0.8, 2.2, 2.2, 'furniture', F2);
+      box(s * 11, 7.5, 5, 2.6, 0.4, 'floor', SLAB);                                 // balcony
+      box(s * 11, 8.7, 5, 0.15, 1.0, 'railing', F2); box(s * 13.45, 7.5, 0.15, 2.6, 1.0, 'railing', F2); box(s * 8.55, 7.5, 0.15, 2.6, 1.0, 'railing', F2);
+      for (const x of [8.8, 13.2]) box(s * x, 8.55, 0.35, 0.35, SLAB, 'marble');
+    }
+    box(-12, -14, 3, 1.2, 0.8, 'furniture', F2); box(-17.5, -12, 0.6, 6, 2.4, 'books', F2);
+    for (const [x, z, h] of [[12, -15, 1.2], [13.3, -15.2, 0.8], [15.5, -10, 1.2], [9.5, -12, 1.0]]) box(x, z, 1.2, 1.2, h, 'trunk', F2);
+    // the front: a columned porch over the door, and steps
+    for (const x of [-4, -2.2, 2.2, 4]) box(x, 9.6, 0.5, 0.5, 6.6, 'marble', 0.3);
+    box(0, 8.2, 9.2, 4.4, 0.3, 'stone'); box(0, 10.9, 6, 1, 0.15, 'stone');
+    box(0, 8.2, 9.6, 4.6, 0.4, 'slate', 6.9);
+    // the back: a raised stone terrace with a balustrade and steps down to the garden
+    box(0, -21.2, 32, 6.4, 0.4, 'stone');
+    box(-9.5, -24.3, 13, 0.4, 1.0, 'stone', 0.4); box(9.5, -24.3, 13, 0.4, 1.0, 'stone', 0.4);
+    box(-15.8, -21.2, 0.4, 6.4, 1.0, 'stone', 0.4); box(15.8, -21.2, 0.4, 6.4, 1.0, 'stone', 0.4);
+    box(0, -25, 6, 1, 0.2, 'stone');
+    for (const x of [-9, 9]) box(x, -21.5, 1.2, 1.2, 0.8, 'planter', 0.4);
+
+    /* the front courtyard: a round drive, a fountain, statues and clipped hedges */
+    const F = [0, 32];
+    box(F[0], F[1] - 4, 8.5, 0.5, 0.7, 'marble'); box(F[0], F[1] + 4, 8.5, 0.5, 0.7, 'marble');
+    box(F[0] - 4, F[1], 0.5, 7.5, 0.7, 'marble'); box(F[0] + 4, F[1], 0.5, 7.5, 0.7, 'marble');
+    box(F[0], F[1], 1.4, 1.4, 1.2, 'marble'); box(F[0], F[1], 2.8, 2.8, 0.3, 'marble', 1.2); box(F[0], F[1], 0.7, 0.7, 1.5, 'statue', 1.5);
+    for (const s of [-1, 1]) {
+      for (const [z0, z1] of [[12, 20], [44, 62]]) box(s * 4.5, (z0 + z1) / 2, 0.9, z1 - z0, 1.1, 'hedge');
+      for (const z of [16, 26, 38, 54]) { box(s * 14, z, 1.2, 1.2, 1.0, 'stone'); box(s * 14, z, 0.6, 0.6, 1.6, 'statue', 1.0); }
+      box(s * 22, 12, 1.6, 1.6, 2.4, 'hedge'); box(s * 22, 12, 0.9, 0.9, 1.0, 'hedge', 2.4);
+      for (const z of [22, 42]) box(s * 9.5, z, 2, 0.5, 0.5, 'furniture');           // benches
+    }
+    box(8, 52, 4.4, 1.9, 1.15, 'car'); box(8.3, 52, 2.2, 1.6, 0.6, 'car', 1.15);   // a parked old car on the drive
+    // hedge mazes in both front corners (the same maze, mirrored)
+    const CW = 4, NX = 7, NZ = 8, MX0 = 34, MZ0 = 24, MT = 0.7, MH = 2.6;
+    const vis = [], hW = [], vW = [];
+    for (let i = 0; i < NX; i++) { vis.push([]); for (let j = 0; j < NZ; j++) vis[i].push(false); }
+    for (let i = 0; i <= NX; i++) { vW.push([]); for (let j = 0; j < NZ; j++) vW[i].push(true); }
+    for (let i = 0; i < NX; i++) { hW.push([]); for (let j = 0; j <= NZ; j++) hW[i].push(true); }
+    const stack = [[3, 4]]; vis[3][4] = true;
+    while (stack.length) {
+      const [ci, cj] = stack[stack.length - 1];
+      const nb = [[1, 0], [-1, 0], [0, 1], [0, -1]].map(([dx, dz]) => [ci + dx, cj + dz, dx, dz]).filter(([a, b]) => a >= 0 && b >= 0 && a < NX && b < NZ && !vis[a][b]);
+      if (!nb.length) { stack.pop(); continue; }
+      const [ni, nj, dx, dz] = nb[Math.floor(rnd() * nb.length)];
+      if (dx) vW[Math.max(ci, ni)][cj] = false; else hW[ci][Math.max(cj, nj)] = false;
+      vis[ni][nj] = true; stack.push([ni, nj]);
+    }
+    for (let i = 1; i < NX; i++) for (let j = 0; j < NZ; j++) if (rnd() < 0.22) vW[i][j] = false;      // a few loops, so it's not a dead-end trap
+    for (let i = 0; i < NX; i++) for (let j = 1; j < NZ; j++) if (rnd() < 0.22) hW[i][j] = false;
+    for (const [i, j] of [[2, 3], [3, 3], [4, 3], [2, 4], [3, 4], [4, 4]]) {                       // a clearing in the middle
+      if (i > 2) vW[i][j] = false; if (j > 3) hW[i][j] = false;
+    }
+    vW[0][2] = vW[0][6] = vW[NX][2] = vW[NX][5] = false; hW[1][0] = hW[5][0] = hW[3][NZ] = hW[6][NZ] = false;   // ways in
+    for (const s of [-1, 1]) {
+      const mx = c => s * (MX0 + c);
+      for (let i = 0; i <= NX; i++) {          // walls running along z, merged where they line up
+        let j = 0;
+        while (j < NZ) {
+          if (!vW[i][j]) { j++; continue; }
+          let e = j; while (e < NZ && vW[i][e]) e++;
+          box(mx(i * CW), MZ0 + (j + e) / 2 * CW, MT, (e - j) * CW + MT, MH, 'hedge'); j = e;
+        }
+      }
+      for (let j = 0; j <= NZ; j++) {
+        let i = 0;
+        while (i < NX) {
+          if (!hW[i][j]) { i++; continue; }
+          let e = i; while (e < NX && hW[e][j]) e++;
+          box(s * (MX0 + (i + e) / 2 * CW), MZ0 + j * CW, (e - i) * CW + MT, MT, MH, 'hedge'); i = e;
+        }
+      }
+      box(mx(3.5 * CW), MZ0 + 4 * CW, 1.2, 1.2, 1.0, 'stone'); box(mx(3.5 * CW), MZ0 + 4 * CW, 0.6, 0.6, 1.7, 'statue', 1.0);
+    }
+
+    /* the sides: carriage houses facing the house, rose beds and topiary */
+    for (const s of [-1, 1]) {
+      const cx = s * 54, cz = -4, hx = 5, hz = 7;
+      wallWith(box, 'z', cx - s * hx, cz - hz, cz + hz, 0.4, 4, 'brick', [[cz, 6.5, 0, 3.4]]);
+      wallWith(box, 'z', cx + s * hx, cz - hz, cz + hz, 0.4, 4, 'brick', [[cz - 3, 1.4, 1.2, 2.4], [cz + 3, 1.4, 1.2, 2.4]]);
+      wallWith(box, 'x', cz - hz, cx - hx, cx + hx, 0.4, 4, 'brick', [[cx, 1.2, 0, 2.4]]);
+      wallWith(box, 'x', cz + hz, cx - hx, cx + hx, 0.4, 4, 'brick', [[cx, 1.4, 1.2, 2.4]]);
+      box(cx, cz, 2 * hx + 1, 2 * hz + 1, 0.35, 'slate', 4); box(cx, cz, 2 * hx - 2, 2 * hz - 2, 0.6, 'slate', 4.35);
+      box(cx + s * 1, cz - 2.5, 4.4, 1.9, 1.15, 'car'); box(cx + s * 1.3, cz - 2.5, 2.2, 1.6, 0.6, 'car', 1.15);
+      box(cx + s * 3.6, cz + 4, 1.2, 4, 1.0, 'furniture'); box(cx - s * 1, cz + 4.5, 1.2, 1.2, 1.2, 'trunk'); box(cx - s * 2.4, cz + 4.6, 1.0, 1.0, 1.0, 'trunk');
+      for (const z of [-14, -2, 10]) for (let r = 0; r < 2; r++) box(s * (24 + r * 4), z, 0.9, 6, 0.9, 'hedge');
+      for (const [x, z] of [[30, 2], [30, -12], [40, 14], [40, -20], [62, -26], [62, 16], [44, -32]]) { box(s * x, z, 1.4, 1.4, 1.6, 'hedge'); box(s * x, z, 0.8, 0.8, 0.9, 'hedge', 1.6); }
+    }
+
+    /* the back garden: an ornamental pond with an island, a gazebo and a greenhouse */
+    const PZ = -46;
+    box(0, PZ - 7, 28.6, 0.6, 0.45, 'stone'); box(0, PZ + 7, 28.6, 0.6, 0.45, 'stone');
+    box(-14, PZ, 0.6, 14, 0.45, 'stone'); box(14, PZ, 0.6, 14, 0.45, 'stone');
+    box(0, PZ, 3.4, 3.4, 0.45, 'stone'); box(0, PZ, 0.8, 0.8, 1.8, 'statue', 0.45);
+    for (const x of [-7, 7]) box(x, PZ, 1.8, 0.6, 0.5, 'stone');                   // stepping stones over the water
+    // gazebo
+    const GX = -40, GZ = -48;
+    box(GX, GZ, 7, 7, 0.35, 'stone');
+    for (const [dx, dz] of [[-3, -3], [3, -3], [-3, 3], [3, 3], [0, -3], [0, 3], [-3, 0], [3, 0]]) box(GX + dx, GZ + dz, 0.35, 0.35, 3.0, 'marble', 0.35);
+    for (const [dx, dz, w, d] of [[-1.5, -3, 2.6, 0.2], [1.5, -3, 2.6, 0.2], [-3, -1.5, 0.2, 2.6], [-3, 1.5, 0.2, 2.6], [3, -1.5, 0.2, 2.6], [3, 1.5, 0.2, 2.6]]) box(GX + dx, GZ + dz, w, d, 0.9, 'railing', 0.35);
+    box(GX, GZ, 8, 8, 0.3, 'slate', 3.35); box(GX, GZ, 6, 6, 0.4, 'slate', 3.65); box(GX, GZ, 4, 4, 0.4, 'slate', 4.05); box(GX, GZ, 1.6, 1.6, 0.6, 'slate', 4.45);
+    box(GX, GZ, 1.3, 1.3, 0.8, 'furniture', 0.35);
+    // greenhouse: low brick walls, a white iron frame and planting beds (open between the frames)
+    const HX = 40, HZ = -48, hx2 = 6, hz2 = 4;
+    wallWith(box, 'x', HZ - hz2, HX - hx2, HX + hx2, 0.3, 0.9, 'brick', []);
+    wallWith(box, 'x', HZ + hz2, HX - hx2, HX + hx2, 0.3, 0.9, 'brick', [[HX + 1.5, 1.8, 0, 0.9]]);
+    wallWith(box, 'z', HX - hx2, HZ - hz2, HZ + hz2, 0.3, 0.9, 'brick', [[HZ + 2, 1.8, 0, 0.9]]);
+    wallWith(box, 'z', HX + hx2, HZ - hz2, HZ + hz2, 0.3, 0.9, 'brick', []);
+    for (let x = -hx2; x <= hx2; x += 3) for (const z of [-hz2, hz2]) box(HX + x, HZ + z, 0.18, 0.18, 3.2, 'frame', 0.9);
+    for (const x of [-hx2, hx2]) box(HX + x, HZ, 0.18, 0.18, 3.2, 'frame', 0.9);
+    for (const z of [-hz2, 0, hz2]) box(HX, HZ + z, 2 * hx2 + 0.2, 0.16, 0.16, 'frame', 4.1);
+    for (let x = -hx2; x <= hx2; x += 3) box(HX + x, HZ, 0.16, 2 * hz2, 0.16, 'frame', 4.1);
+    box(HX - 2.5, HZ, 5, 1.2, 0.8, 'planter'); box(HX + 3.2, HZ - 1.6, 3.4, 1.2, 0.8, 'planter'); box(HX + 3.2, HZ + 1.6, 3.4, 1.2, 0.8, 'planter');
+    // garden hedges and box trees around the back
+    for (const s of [-1, 1]) {
+      for (const z of [-30, -62]) box(s * 20, z, 14, 0.9, 1.2, 'hedge');
+      for (const [x, z] of [[26, -36], [26, -56], [56, -40], [56, -58], [10, -62], [30, -66]]) { box(s * x, z, 1.4, 1.4, 1.8, 'hedge'); box(s * x, z, 0.8, 0.8, 1.0, 'hedge', 1.8); }
+      box(s * 60, -50, 6, 0.9, 1.2, 'hedge'); box(s * 48, -26, 0.9, 6, 1.2, 'hedge');
+    }
+
+    const spawns = [
+      [-24, 64], [24, 64], [-15, 50], [15, 50], [0, 64], [-27, 15], [27, 15], [0, 17], [-10, 26], [10, 40],
+      [-30, -62], [30, -62], [0, -64], [-24, -33], [24, -33], [-58, -62], [58, -62], [-50, -36], [50, -36],
+      [-63, -22], [63, -22], [-63, 12], [63, 12], [-7.8, 3.6], [8, 3.6], [-14.5, -14.6], [15, -8.6], [-44, 40], [44, 40],
+    ];
+    const teamSpawns = [
+      [[-64, -60], [-66, -53], [-64, -40], [-64, -30], [-64, -20], [-64, -14], [-64, 8], [-64, 16], [-58, -34], [-60, 12]],
+      [[64, -60], [66, -53], [64, -40], [64, -30], [64, -20], [64, -14], [64, 8], [64, 16], [58, -34], [60, 12]],
+    ];
+    const patches = [
+      [-3, 11.4, 3, H, 'gravel'], [-11, 22, 11, 42, 'gravel'], [-X, ZB, X, ZF, 'parquet'], [-2.5, -16, 2.5, 4.8, 'rug'],
+      [-16, -24.4, 16, -18, 'terrace'], [-13.7, PZ - 6.7, 13.7, PZ + 6.7, 'water'], [-3.6, 28.4, 3.6, 35.6, 'water'],
+      [GX - 3.5, GZ - 3.5, GX + 3.5, GZ + 3.5, 'terrace'], [HX - hx2, HZ - hz2, HX + hx2, HZ + hz2, 'terrace'],
+      [-59, -11, -49, 3, 'terrace'], [49, -11, 59, 3, 'terrace'], [-3, -70, 3, -25.4, 'gravel'],
+    ];
+    return {
+      id: 'manor', name: 'Manor', blurb: 'A grand old house at golden hour: two floors of rooms, twin staircases, hedge mazes and a fountain courtyard.',
+      half: H, boxes, spawns, teamSpawns, roads: [], pads: [], patches,
+      zone: { r0: 110, r1: 8, centre: 25 },
+      showcase: { x: 9, z: 15.5 },
+      overview: { x: -58, y: 24, z: 66, lx: 0, ly: 3, lz: -4 },
+      theme: {
+        ground: 'lawn', sky: ['#5b84c2', '#f2c9a0', '#f6dcc0'], haze: '#efd3b3', fog: [55, 320],
+        sun: '#ffcf9e', sunI: 1.55, sunDir: [0.62, 0.5, 0.6], hemi: ['#ffe6cc', '#566a3f', 0.66], decor: 'oaks',
+      },
+    };
+  }
+
+  const MAPS = { outpost: outpost(), manor: manor() };
   const MAP_LIST = Object.keys(MAPS);
 
   /* ---------- geometry helpers shared by the page and the server ---------- */
