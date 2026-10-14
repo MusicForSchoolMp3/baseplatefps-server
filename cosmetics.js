@@ -89,7 +89,27 @@
     return it.need.k === 'bestStreak' ? it.need.n + ' ' + w[0] : it.need.n + ' ' + (it.need.n === 1 ? w[0] : w[1]);
   }
 
-  const api = { STATS, TIERS, OWNERS, ITEMS, SLOTS, item, isOwner, unlocked, needText };
+  // weapon skins. Exclusive skins are never sold: only the owners, and accounts the owner grants them to
+  // (users/<uid>/grants/<skin id> = true in the database, which only the owner can set from the Firebase console)
+  const WEAPON_LIST = ['rifle', 'pistol', 'sniper'];
+  const SK = (id, name, tier, blurb, exclusive) => ({ id, name, tier, blurb, exclusive: !!exclusive });
+  const SKINS = {
+    rifle: [SK('default', 'Standard issue', 'common', 'Tan polymer and black steel.'),
+      SK('nebula', 'Nebula Flow', 'legendary', 'Blue and violet liquid that never stops moving across the whole gun.', true)],
+    pistol: [SK('default', 'Standard issue', 'common', 'Black steel slide and polymer frame.'),
+      SK('banana', 'Banana Blaster', 'legendary', 'A ripe banana. Inspect it to peel it and take a bite. The peels fly back every shot.', true)],
+    sniper: [SK('default', 'Standard issue', 'common', 'Olive stock and heavy steel barrel.'),
+      SK('crimson', 'Crimson Laser', 'legendary', 'Red energy crackles through glass panels along the barrel and stock.', true)],
+  };
+  const skin = (weapon, id) => (SKINS[weapon] || []).find(k => k.id === id) || null;
+  function skinUnlocked(weapon, id, owner, grants) {
+    const k = skin(weapon, id);
+    if (!k) return false;
+    if (!k.exclusive || owner) return true;
+    return !!(grants && grants[id] === true);
+  }
+
+  const api = { STATS, TIERS, OWNERS, ITEMS, SLOTS, item, isOwner, unlocked, needText, WEAPON_LIST, SKINS, skin, skinUnlocked };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.BPCos = api;
 })(typeof window !== 'undefined' ? window : this);

@@ -15,7 +15,7 @@ const PORT = Number(process.env.PORT) || 8080;
 const PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'baseplatefps-e1fc1';
 const DATABASE_URL = process.env.FIREBASE_DATABASE_URL || 'https://baseplatefps-e1fc1-default-rtdb.asia-southeast1.firebasedatabase.app';
 const DEV_TOKENS = process.env.DEV_TOKENS === '1';           // local testing only, never set this on Render
-const PROTO = 5;
+const PROTO = 6;
 const EMAIL_DOMAIN = 'players.baseplatefps.game';
 const USER_RE = /^[A-Za-z0-9]{3,20}$/;
 
@@ -41,6 +41,7 @@ const RELOAD_REFILL = 1.44 / 2.1;                            // the client's fre
 const SHOT_BURST = 2.5;                                      // shots that may arrive bunched together by network jitter
 const HIST_MS = 800;                                         // how far back a shooter's view of a target may lag
 const HIST_TOL = 1.0;                                        // metres the shooter's view may stray from the target's real path
+const CROUCH_DROP = 0.38;                                    // how much lower a crouching body's chest and head sit
 
 /* ---------- Firebase ---------- */
 let admin = null, db = null;
@@ -77,7 +78,7 @@ async function verifyToken(token) {
 const modRec = new Map();     // uid -> { banned, tamperAt } — cheater warnings and bans, server-only
 const TAMPER_BAN_MS = (Number(process.env.TAMPER_BAN_S) || 5 * 60 * 60) * 1000;   // a second DevTools open within 5 hours is a ban
 
-async function loadProfile(who, requested) {
+async function loadProfile(who, requested, requestedSkins) {
   const fromEmail = String(who.email).split('@')[0];
   let name = who.devName || fromEmail;
   const pickSlots = a => Object.fromEntries(COS.SLOTS.map(sl => [sl, a && typeof a[sl] === 'string' && COS.item(sl, a[sl]) ? a[sl] : 'none']));
@@ -85,12 +86,17 @@ async function loadProfile(who, requested) {
   // so it can't be faked, and it doesn't depend on the website having saved it to the database first
   const asked = !!requested && typeof requested === 'object';
   let avatar = pickSlots(requested), saved = null;
+  const pickSkins = a => Object.fromEntries(COS.WEAPON_LIST.map(w => [w, a && typeof a[w] === 'string' && COS.skin(w, a[w]) ? a[w] : 'default']));
+  const askedSkins = !!requestedSkins && typeof requestedSkins === 'object';
+  let skins = pickSkins(requestedSkins), savedSkins = null, grants = null;
   const stats = Object.assign(blankStats(), memStats.get(who.uid) || {});
   if (db) {
     try {
       const u = (await db.ref('users/' + who.uid).once('value')).val() || {};
       if (typeof u.username === 'string' && u.username.toLowerCase() === fromEmail) name = u.username;
       if (u.avatar && typeof u.avatar === 'object') { saved = pickSlots(u.avatar); if (!asked) avatar = saved; }
+      if (u.grants && typeof u.grants === 'object') grants = u.grants;
+      if (u.skins && typeof u.skins === 'object') { savedSkins = pickSkins(u.skins); if (!askedSkins) skins = savedSkins; }
       if (u.stats && typeof u.stats === 'object') for (const k of Object.keys(blankStats())) stats[k] = Number(u.stats[k]) || 0;
       if (u.mod && typeof u.mod === 'object' && !modRec.has(who.uid)) modRec.set(who.uid, { banned: !!u.mod.banned, tamperAt: Number(u.mod.tamperAt) || 0 });
     } catch (e) { console.warn('Could not read profile', who.uid, e.message); }
@@ -99,7 +105,7 @@ async function loadProfile(who, requested) {
   if (!USER_RE.test(name)) name = (fromEmail.replace(/[^A-Za-z0-9]/g, '').slice(0, 20)) || 'Player';
   // the owner list is matched against the verified sign-in email, so nobody can claim it from their browser
   const owner = String(who.email).toLowerCase() === fromEmail.toLowerCase() + '@' + EMAIL_DOMAIN && COS.isOwner(fromEmail);
-  return { name, stats, avatar, saved, owner, banned: (modRec.get(who.uid) || {}).banned };
+  return { name, stats, avatar, saved, skins, savedSkins, grants, owner, banned: (modRec.get(who.uid) || {}).banned };
 }
 
 function onTamper(p) {
@@ -157,7 +163,7 @@ let nextId = 1;
 function makeRoom(code, isPublic) {
   const room = {
     code, isPublic, max: isPublic ? PUBLIC_MAX : PRIVATE_MAX, players: new Map(),
-    phase: 'wait', t: 0, rid: 0, mode: 'ffa', map: MAPS.MAP_LIST[0], teamKills: [0, 0], cx: 0, cz: 0, zoneK: 0, result: '',
+    phase: 'wait', t: 0, rid: 0, mode: 'ffa', map: pick(MAPS.MAP_LIST), teamKills: [0, 0], cx: 0, cz: 0, zoneK: 0, result: '',
   };
   rooms.set(code, room);
   return room;
@@ -199,7 +205,8 @@ function spawn(room, p) {
   p.hp = 100; p.alive = true; p.zoneAcc = 0; p.respawnAt = 0; p.protectUntil = Date.now() + PROTECT_MS;
   for (const id of WEAPON_LIST) p.ammo[id] = WEAPONS[id].mag;
   p.reloadUntil = 0;
-  p.hist = [{ t: Date.now(), x, y: 0, z, vx: 0, vy: 0, vz: 0 }];          // a fresh life: no shooting at where they died
+  p.hist = [{ t: Date.now(), x, y: 0, z, vx: 0, vy: 0, vz: 0, cr: 0 }];   // a fresh life: no shooting at where they died
+  p.s.cr = false;
   send(p, { t: 'spawn', p: p.s.p, yw });
 }
 function aliveIn(room) {
@@ -262,8 +269,8 @@ function tally(room) {
 }
 function winnerOf(counts, current) {
   const top = Math.max(...Object.values(counts));
-  if (top === 0) return current;                              // nobody voted: keep what we had
-  return pick(Object.keys(counts).filter(k => counts[k] === top));
+  if (top === 0) return pick(Object.keys(counts));             // nobody voted: anything can come up
+  return pick(Object.keys(counts).filter(k => counts[k] === top));   // a tie: one of the tied options at random
 }
 
 function kill(room, victim, killer, weapon, head, byZone, quit) {
@@ -335,15 +342,15 @@ function tickRoom(room, dt) {
       break;
   }
 
-  // snapshot: [id, name, x, y, z, vx, vy, vz, yaw, pitch, flags, weapon, shots, ex, ey, ez, hp, cosmetic, kills, team, deaths]
+  // snapshot: [id, name, x, y, z, vx, vy, vz, yaw, pitch, flags, weapon, shots, ex, ey, ez, hp, cosmetic, kills, team, deaths, skins]
   const ps = [];
   let alive = 0;
   for (const p of room.players.values()) {
     const s = p.s, ir = inRound(room, p);
     if (p.alive && ir) alive++;
-    const flags = (s.g ? 1 : 0) | (s.sp ? 2 : 0) | (s.ad ? 4 : 0) | (s.rl ? 8 : 0) | (p.alive ? 16 : 0) | (ir ? 32 : 0) | (now < p.protectUntil ? 64 : 0);
+    const flags = (s.g ? 1 : 0) | (s.sp ? 2 : 0) | (s.ad ? 4 : 0) | (s.rl ? 8 : 0) | (p.alive ? 16 : 0) | (ir ? 32 : 0) | (now < p.protectUntil ? 64 : 0) | (s.cr ? 128 : 0);
     ps.push([p.id, p.name, s.p[0], s.p[1], s.p[2], s.v[0], s.v[1], s.v[2], s.yw, s.pt, flags,
-      WEAPON_LIST.indexOf(s.w), p.shots, p.se[0], p.se[1], p.se[2], Math.max(0, Math.ceil(p.hp)), p.cos, p.kills, p.team, p.deaths]);
+      WEAPON_LIST.indexOf(s.w), p.shots, p.se[0], p.se[1], p.se[2], Math.max(0, Math.ceil(p.hp)), p.cos, p.kills, p.team, p.deaths, p.skins]);
   }
   const meta = { rid: room.rid, phase: room.phase, t: r2(room.t), dur: phaseDur(room), mode: room.mode, map: room.map,
     cx: room.cx, cz: room.cz, res: room.result, al: alive, n, code: room.isPublic ? '' : room.code, tk: room.teamKills };
@@ -357,6 +364,7 @@ setInterval(() => {
 
 /* ---------- joining and leaving ---------- */
 function joinRoom(p, room) {
+  if (room.players.size === 0 && room.phase === 'wait' && !(DEV_TOKENS && process.env.START_MAP)) room.map = pick(MAPS.MAP_LIST);   // nobody here: a fresh random map
   p.room = room;
   room.players.set(p.id, p);
   p.part = 0; p.team = -1; p.kills = 0; p.deaths = 0;
@@ -397,7 +405,7 @@ async function onHello(p, msg) {
   try { who = await verifyToken(msg.token); }
   catch (e) { send(p, { t: 'err', code: 'auth' }); p.ws.close(); return; }
   if (p.ws.readyState !== 1) return;
-  const prof = await loadProfile(who, msg.cos);
+  const prof = await loadProfile(who, msg.cos, msg.skins);
   if (p.ws.readyState !== 1) return;
   if (prof.banned) { send(p, { t: 'err', code: 'banned' }); setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 400); return; }
   const old = byUid.get(who.uid);
@@ -419,9 +427,12 @@ async function onHello(p, msg) {
   p.cos = COS.SLOTS.map(sl => wear[sl] === 'none' ? '' : wear[sl]).join('|');
   // keep the account's saved outfit in step (the server can always write it, whatever the database rules say)
   if (db && COS.SLOTS.some(sl => !prof.saved || prof.saved[sl] !== wear[sl])) db.ref('users/' + who.uid + '/avatar').set(wear).catch(e => console.warn('avatar not saved for', who.uid, e.message));
+  const skins = Object.fromEntries(COS.WEAPON_LIST.map(w => [w, COS.skinUnlocked(w, prof.skins[w], prof.owner, prof.grants) ? prof.skins[w] : 'default']));
+  p.skins = COS.WEAPON_LIST.map(w => skins[w] === 'default' ? '' : skins[w]).join('|');
+  if (db && COS.WEAPON_LIST.some(w => !prof.savedSkins || prof.savedSkins[w] !== skins[w])) db.ref('users/' + who.uid + '/skins').set(skins).catch(e => console.warn('skins not saved for', who.uid, e.message));
   p.s.w = p.loadout[0]; p.wSince = 0;
   byUid.set(p.uid, p);
-  send(p, { t: 'welcome', id: p.id, name: p.name, cos: p.cos, room: room.isPublic ? '' : room.code, pub: room.isPublic, max: room.max,
+  send(p, { t: 'welcome', id: p.id, name: p.name, cos: p.cos, skins: p.skins, room: room.isPublic ? '' : room.code, pub: room.isPublic, max: room.max,
     modes: MODES, maps: MAPS.MAP_LIST, roundS: ROUND_S, voteS: VOTE_S });
   joinRoom(p, room);
   console.log(`${p.name} joined ${room.code} (${room.players.size} players)`);
@@ -447,11 +458,11 @@ function onUpdate(p, msg) {
   const v = vec3(msg.v, 40); if (v) s.v = v;
   // where this player has been lately, so shots can be checked against what the shooter actually saw
   const h = p.hist;
-  h.push({ t: now, x: s.p[0], y: s.p[1], z: s.p[2], vx: s.v[0], vy: s.v[1], vz: s.v[2] });
+  h.push({ t: now, x: s.p[0], y: s.p[1], z: s.p[2], vx: s.v[0], vy: s.v[1], vz: s.v[2], cr: s.cr ? 1 : 0 });
   while (h.length > 2 && now - h[1].t > HIST_MS) h.shift();
   if (h.length > 40) h.splice(0, h.length - 40);
   s.yw = num(msg.yw, s.yw); s.pt = clamp(num(msg.pt, s.pt), -1.6, 1.6);
-  s.g = !!msg.g; s.sp = !!msg.sp; s.ad = !!msg.ad; s.rl = !!msg.rl;
+  s.g = !!msg.g; s.sp = !!msg.sp; s.ad = !!msg.ad; s.rl = !!msg.rl; s.cr = !!msg.cr;
   if (typeof msg.w === 'string' && msg.w !== s.w && p.loadout.includes(msg.w)) {
     // switching cancels a reload, like on the client; if the new mag was already in, the client kept it
     if (p.reloadUntil && p.reloadWeapon === s.w && now >= p.reloadStart + RELOAD_REFILL * WEAPONS[s.w].reload - 120) p.ammo[s.w] = WEAPONS[s.w].mag;
@@ -480,6 +491,11 @@ function segDist(px, py, pz, ax, ay, az, bx, by, bz) {
   const dx = bx - ax, dy = by - ay, dz = bz - az, l2 = dx * dx + dy * dy + dz * dz;
   const u = l2 > 1e-9 ? clamp(((px - ax) * dx + (py - ay) * dy + (pz - az) * dz) / l2, 0, 1) : 0;
   return Math.hypot(px - (ax + dx * u), py - (ay + dy * u), pz - (az + dz * u));
+}
+function crouchRange(target, now) {                                        // how crouched the target may have looked lately
+  let lo = target.s.cr ? 1 : 0, hi = lo;
+  for (const e of target.hist || []) if (now - e.t <= HIST_MS + 300) { lo = Math.min(lo, e.cr || 0); hi = Math.max(hi, e.cr || 0); }
+  return [lo, hi];
 }
 function onTargetPath(target, x, y, z, now) {
   const h = target.hist || [], s = target.s;
@@ -551,8 +567,9 @@ function onShot(p, msg) {
   // ...at a target drawn where it really was a moment ago
   if (!onTargetPath(target, tp[0], tp[1], tp[2], now)) return;
   // ...and actually pass through the body there (same shapes the client tests, a hair bigger)
-  const tHead = raySphere(o[0], o[1], o[2], dx, dy, dz, tp[0], tp[1] + 1.66, tp[2], 0.18);
-  const tBody = rayCapsule(o[0], o[1], o[2], dx, dy, dz, tp[0], tp[1] + 0.12, tp[1] + 1.42, tp[2], 0.3);
+  const [clo, chi] = crouchRange(target, now), tc = clamp(num(msg.tc, 0), clo, chi), drop = CROUCH_DROP * tc;
+  const tHead = raySphere(o[0], o[1], o[2], dx, dy, dz, tp[0], tp[1] + 1.66 - drop, tp[2], 0.18);
+  const tBody = rayCapsule(o[0], o[1], o[2], dx, dy, dz, tp[0], tp[1] + 0.12, tp[1] + 1.42 - drop, tp[2], 0.3);
   if (tHead < 0 && tBody < 0) return;
   const head = tHead >= 0 && (tBody < 0 || tHead <= tBody + 0.05);         // the server decides headshots, not the client
   const dist = head ? tHead : tBody;
@@ -594,7 +611,7 @@ wss.on('connection', ws => {
     s: { p: [0, 0, 0], v: [0, 0, 0], yw: 0, pt: 0, g: true, sp: false, ad: false, rl: false, w: 'rifle' },
     hp: 100, alive: true, part: 0, team: -1, kills: 0, deaths: 0, shots: 0, se: [0, 0, 0], lastShot: 0, wSince: 0, zoneAcc: 0,
     respawnAt: 0, protectUntil: 0, lastHurtBy: null, lastHurtAt: 0, voteMode: '', voteMap: '',
-    ammo: { rifle: 30, pistol: 12, sniper: 1 }, reloadUntil: 0, reloadStart: 0, reloadWeapon: '',
+    ammo: { rifle: 30, pistol: 12, sniper: 1 }, reloadUntil: 0, reloadStart: 0, reloadWeapon: '', skins: '||',
     hist: [], shotCredit: SHOT_BURST, creditAt: 0,
     lastPosAt: 0, lastFixAt: 0, msgs: 0, msgWindow: Date.now() };
   const helloTimer = setTimeout(() => { if (!p.authed) ws.close(); }, 15000);
