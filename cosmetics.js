@@ -101,15 +101,19 @@
     sniper: [SK('default', 'Standard issue', 'common', 'Olive stock and heavy steel barrel.'),
       SK('crimson', 'Crimson Laser', 'legendary', 'Red energy crackles through glass panels along the barrel and stock.', true)],
   };
+  // exclusive skins given to particular accounts (by username, matched to the signed-in email like the owners)
+  const SKIN_GRANTS = { soggybiscuit: ['nebula', 'banana', 'crimson'] };
   const skin = (weapon, id) => (SKINS[weapon] || []).find(k => k.id === id) || null;
-  function skinUnlocked(weapon, id, owner, grants) {
+  function skinUnlocked(weapon, id, owner, grants, name) {
     const k = skin(weapon, id);
     if (!k) return false;
     if (!k.exclusive || owner) return true;
+    const given = SKIN_GRANTS[String(name || '').toLowerCase()];
+    if (given && given.includes(id)) return true;
     return !!(grants && grants[id] === true);
   }
 
-  const api = { STATS, TIERS, OWNERS, ITEMS, SLOTS, item, isOwner, unlocked, needText, WEAPON_LIST, SKINS, skin, skinUnlocked };
+  const api = { STATS, TIERS, OWNERS, ITEMS, SLOTS, item, isOwner, unlocked, needText, WEAPON_LIST, SKINS, SKIN_GRANTS, skin, skinUnlocked };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.BPCos = api;
 })(typeof window !== 'undefined' ? window : this);

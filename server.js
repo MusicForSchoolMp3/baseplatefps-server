@@ -32,7 +32,7 @@ const TEAM_NAMES = ['Blue', 'Red'];
 const WEAPONS = {
   rifle:  { interval: 60 / 750, body: 20, head: 45, range: 330, mag: 30, reload: 2100 },
   pistol: { interval: 60 / 420, body: 24, head: 55, range: 150, falloffAt: 40, falloff: 0.75, mag: 12, reload: 1500 },
-  sniper: { interval: 1.6,      body: 85, head: 150, range: 720, mag: 1, reload: 2200 },     // one round, then a reload
+  sniper: { interval: 1.6,      body: 100, head: 150, range: 720, mag: 1, reload: 2200 },    // one round, then a reload; any hit kills
 };
 const WEAPON_LIST = ['rifle', 'pistol', 'sniper'];
 const SWITCH_LOCK_MS = 900;                                  // client waits 1.0 s; a little slack for lag
@@ -104,8 +104,9 @@ async function loadProfile(who, requested, requestedSkins) {
   memStats.set(who.uid, stats);
   if (!USER_RE.test(name)) name = (fromEmail.replace(/[^A-Za-z0-9]/g, '').slice(0, 20)) || 'Player';
   // the owner list is matched against the verified sign-in email, so nobody can claim it from their browser
-  const owner = String(who.email).toLowerCase() === fromEmail.toLowerCase() + '@' + EMAIL_DOMAIN && COS.isOwner(fromEmail);
-  return { name, stats, avatar, saved, skins, savedSkins, grants, owner, banned: (modRec.get(who.uid) || {}).banned };
+  const verified = String(who.email).toLowerCase() === fromEmail.toLowerCase() + '@' + EMAIL_DOMAIN ? fromEmail.toLowerCase() : '';
+  const owner = !!verified && COS.isOwner(verified);
+  return { name, stats, avatar, saved, skins, savedSkins, grants, owner, verified, banned: (modRec.get(who.uid) || {}).banned };
 }
 
 function onTamper(p) {
@@ -407,6 +408,7 @@ async function onHello(p, msg) {
   if (p.ws.readyState !== 1) return;
   const prof = await loadProfile(who, msg.cos, msg.skins);
   if (p.ws.readyState !== 1) return;
+  if (prof.verified) knownNames.set(prof.verified, who.uid);
   if (prof.banned) { send(p, { t: 'err', code: 'banned' }); setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 400); return; }
   const old = byUid.get(who.uid);
   if (old && old !== p) { send(old, { t: 'err', code: 'elsewhere' }); leaveRoom(old, 'signed in elsewhere'); try { old.ws.close(); } catch (_) {} }
@@ -427,7 +429,7 @@ async function onHello(p, msg) {
   p.cos = COS.SLOTS.map(sl => wear[sl] === 'none' ? '' : wear[sl]).join('|');
   // keep the account's saved outfit in step (the server can always write it, whatever the database rules say)
   if (db && COS.SLOTS.some(sl => !prof.saved || prof.saved[sl] !== wear[sl])) db.ref('users/' + who.uid + '/avatar').set(wear).catch(e => console.warn('avatar not saved for', who.uid, e.message));
-  const skins = Object.fromEntries(COS.WEAPON_LIST.map(w => [w, COS.skinUnlocked(w, prof.skins[w], prof.owner, prof.grants) ? prof.skins[w] : 'default']));
+  const skins = Object.fromEntries(COS.WEAPON_LIST.map(w => [w, COS.skinUnlocked(w, prof.skins[w], prof.owner, prof.grants, prof.verified) ? prof.skins[w] : 'default']));
   p.skins = COS.WEAPON_LIST.map(w => skins[w] === 'default' ? '' : skins[w]).join('|');
   if (db && COS.WEAPON_LIST.some(w => !prof.savedSkins || prof.savedSkins[w] !== skins[w])) db.ref('users/' + who.uid + '/skins').set(skins).catch(e => console.warn('skins not saved for', who.uid, e.message));
   p.s.w = p.loadout[0]; p.wSince = 0;
@@ -595,8 +597,84 @@ function onVote(p, msg) {
 }
 
 /* ---------- server ---------- */
+/* ---------- moderation (owners only) ----------
+   The website sends the owner's Firebase sign-in token; the server checks it with Google and checks the
+   signed-in email is an owner's. Nothing a browser sends can fake that, so nobody else can ban anyone. */
+const adminLog = [];                                            // recent requests, for a simple rate limit
+const knownNames = new Map();                                   // lower-case username -> uid, for everyone seen since the server started
+function adminSend(res, code, obj) {
+  res.writeHead(code, { 'content-type': 'application/json', 'access-control-allow-origin': '*', 'cache-control': 'no-store' });
+  res.end(JSON.stringify(obj));
+}
+function readBody(req, max) {
+  return new Promise((resolve, reject) => {
+    let n = 0; const chunks = [];
+    req.on('data', c => { n += c.length; if (n > max) { reject(new Error('too big')); req.destroy(); } else chunks.push(c); });
+    req.on('end', () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')); } catch (e) { reject(e); } });
+    req.on('error', reject);
+  });
+}
+async function adminUser(req) {
+  const h = String(req.headers.authorization || '');
+  if (!h.startsWith('Bearer ')) return null;
+  let who; try { who = await verifyToken(h.slice(7)); } catch (_) { return null; }
+  const name = String(who.email).split('@')[0].toLowerCase();
+  if (String(who.email).toLowerCase() !== name + '@' + EMAIL_DOMAIN || !COS.isOwner(name)) return null;
+  return { uid: who.uid, name };
+}
+async function findAccount(name) {                               // an account by username: online first, then the sign-in records
+  const lower = name.toLowerCase();
+  for (const p of byUid.values()) if (p.name.toLowerCase() === lower) return { uid: p.uid, name: p.name };
+  if (knownNames.has(lower)) return { uid: knownNames.get(lower), name };
+  if (db && admin) {
+    try { const u = await admin.auth().getUserByEmail(lower + '@' + EMAIL_DOMAIN); return { uid: u.uid, name: u.displayName || name }; }
+    catch (_) { return null; }
+  }
+  return null;
+}
+async function onAdmin(req, res) {
+  const me = await adminUser(req);                                // a fake or missing sign-in fails here, cheaply
+  if (!me) return adminSend(res, 403, { error: 'Only the owner can do that.' });
+  const now = Date.now();                                          // and even the owner's page can't flood it
+  while (adminLog.length && now - adminLog[0] > 60000) adminLog.shift();
+  if (adminLog.length >= 40) return adminSend(res, 429, { error: 'Too many requests. Wait a minute.' });
+  adminLog.push(now);
+  if (req.method === 'GET' && req.url === '/admin/players') {
+    const list = [];
+    for (const p of byUid.values()) if (p.room) list.push({ name: p.name, room: p.room.isPublic ? 'Public' : p.room.code, kills: p.kills, owner: COS.isOwner(p.name) });
+    return adminSend(res, 200, { players: list.sort((a, b) => a.name.localeCompare(b.name)) });
+  }
+  if (req.method !== 'POST' || !['/admin/ban', '/admin/unban'].includes(req.url)) return adminSend(res, 404, { error: 'Unknown request.' });
+  let body; try { body = await readBody(req, 512); } catch (_) { return adminSend(res, 400, { error: 'Bad request.' }); }
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  if (!USER_RE.test(name)) return adminSend(res, 400, { error: 'Usernames are 3 to 20 letters and numbers.' });
+  if (COS.isOwner(name)) return adminSend(res, 400, { error: "Owners can't be banned." });
+  const acct = await findAccount(name);
+  if (!acct) return adminSend(res, 404, { error: `No account called ${name}.` });
+  if (req.url === '/admin/ban') {
+    modRec.set(acct.uid, { banned: true, tamperAt: Date.now() });
+    if (db) await db.ref('users/' + acct.uid + '/mod').update({ banned: true, bannedAt: admin.database.ServerValue.TIMESTAMP, bannedBy: me.name }).catch(e => console.warn('ban write failed', e.message));
+    const p = byUid.get(acct.uid), online = !!p;
+    if (p) { send(p, { t: 'err', code: 'banned' }); if (p.room) leaveRoom(p, 'banned'); setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 300); }
+    console.log(`${me.name} banned ${acct.name}${online ? ' (kicked from the match)' : ''}`);
+    return adminSend(res, 200, { ok: true, name: acct.name, online, msg: online ? `${acct.name} is banned and was kicked.` : `${acct.name} is banned.` });
+  }
+  modRec.set(acct.uid, { banned: false, tamperAt: 0 });
+  if (db) await db.ref('users/' + acct.uid + '/mod').remove().catch(e => console.warn('unban write failed', e.message));
+  console.log(`${me.name} unbanned ${acct.name}`);
+  return adminSend(res, 200, { ok: true, name: acct.name, msg: `${acct.name} is unbanned.` });
+}
+
 const server = http.createServer((req, res) => {
   if (req.url === '/health') { res.writeHead(200, { 'content-type': 'text/plain' }); res.end('ok'); return; }
+  if (req.url.startsWith('/admin/')) {
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, { 'access-control-allow-origin': '*', 'access-control-allow-headers': 'authorization, content-type', 'access-control-allow-methods': 'GET, POST', 'access-control-max-age': '600' });
+      res.end(); return;
+    }
+    onAdmin(req, res).catch(e => { console.error('admin error', e.message); try { adminSend(res, 500, { error: 'Something went wrong.' }); } catch (_) {} });
+    return;
+  }
   let players = 0; for (const r of rooms.values()) players += r.players.size;
   res.writeHead(200, { 'content-type': 'text/plain', 'access-control-allow-origin': '*' });
   if (DEV_TOKENS && req.url === '/stats') { res.end(JSON.stringify(Object.fromEntries(memStats))); return; }
