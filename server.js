@@ -15,7 +15,7 @@ const PORT = Number(process.env.PORT) || 8080;
 const PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'baseplatefps-e1fc1';
 const DATABASE_URL = process.env.FIREBASE_DATABASE_URL || 'https://baseplatefps-e1fc1-default-rtdb.asia-southeast1.firebasedatabase.app';
 const DEV_TOKENS = process.env.DEV_TOKENS === '1';           // local testing only, never set this on Render
-const PROTO = 4;
+const PROTO = 5;
 const EMAIL_DOMAIN = 'players.baseplatefps.game';
 const USER_RE = /^[A-Za-z0-9]{3,20}$/;
 
@@ -81,13 +81,16 @@ async function loadProfile(who, requested) {
   const fromEmail = String(who.email).split('@')[0];
   let name = who.devName || fromEmail;
   const pickSlots = a => Object.fromEntries(COS.SLOTS.map(sl => [sl, a && typeof a[sl] === 'string' && COS.item(sl, a[sl]) ? a[sl] : 'none']));
-  let avatar = pickSlots(db ? null : requested);   // with a database, only what's saved there counts
+  // what you're wearing comes with your join request; it's checked against your real stats below,
+  // so it can't be faked, and it doesn't depend on the website having saved it to the database first
+  const asked = !!requested && typeof requested === 'object';
+  let avatar = pickSlots(requested), saved = null;
   const stats = Object.assign(blankStats(), memStats.get(who.uid) || {});
   if (db) {
     try {
       const u = (await db.ref('users/' + who.uid).once('value')).val() || {};
       if (typeof u.username === 'string' && u.username.toLowerCase() === fromEmail) name = u.username;
-      if (u.avatar && typeof u.avatar === 'object') avatar = pickSlots(u.avatar);
+      if (u.avatar && typeof u.avatar === 'object') { saved = pickSlots(u.avatar); if (!asked) avatar = saved; }
       if (u.stats && typeof u.stats === 'object') for (const k of Object.keys(blankStats())) stats[k] = Number(u.stats[k]) || 0;
       if (u.mod && typeof u.mod === 'object' && !modRec.has(who.uid)) modRec.set(who.uid, { banned: !!u.mod.banned, tamperAt: Number(u.mod.tamperAt) || 0 });
     } catch (e) { console.warn('Could not read profile', who.uid, e.message); }
@@ -96,7 +99,7 @@ async function loadProfile(who, requested) {
   if (!USER_RE.test(name)) name = (fromEmail.replace(/[^A-Za-z0-9]/g, '').slice(0, 20)) || 'Player';
   // the owner list is matched against the verified sign-in email, so nobody can claim it from their browser
   const owner = String(who.email).toLowerCase() === fromEmail.toLowerCase() + '@' + EMAIL_DOMAIN && COS.isOwner(fromEmail);
-  return { name, stats, avatar, owner, banned: (modRec.get(who.uid) || {}).banned };
+  return { name, stats, avatar, saved, owner, banned: (modRec.get(who.uid) || {}).banned };
 }
 
 function onTamper(p) {
@@ -412,7 +415,10 @@ async function onHello(p, msg) {
   p.loadout = lo.length === 3 && WEAPON_LIST.every(w => lo.includes(w)) ? lo : WEAPON_LIST.slice();
   p.uid = who.uid; p.name = prof.name; p.authed = true;
   // only items this account has really unlocked are shown to anyone
-  p.cos = COS.SLOTS.map(sl => COS.unlocked(sl, prof.avatar[sl], prof.stats, prof.owner) && prof.avatar[sl] !== 'none' ? prof.avatar[sl] : '').join('|');
+  const wear = Object.fromEntries(COS.SLOTS.map(sl => [sl, COS.unlocked(sl, prof.avatar[sl], prof.stats, prof.owner) ? prof.avatar[sl] : 'none']));
+  p.cos = COS.SLOTS.map(sl => wear[sl] === 'none' ? '' : wear[sl]).join('|');
+  // keep the account's saved outfit in step (the server can always write it, whatever the database rules say)
+  if (db && COS.SLOTS.some(sl => !prof.saved || prof.saved[sl] !== wear[sl])) db.ref('users/' + who.uid + '/avatar').set(wear).catch(e => console.warn('avatar not saved for', who.uid, e.message));
   p.s.w = p.loadout[0]; p.wSince = 0;
   byUid.set(p.uid, p);
   send(p, { t: 'welcome', id: p.id, name: p.name, cos: p.cos, room: room.isPublic ? '' : room.code, pub: room.isPublic, max: room.max,
