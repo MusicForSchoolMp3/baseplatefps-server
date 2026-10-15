@@ -625,6 +625,7 @@ async function adminUser(req) {
 async function findAccount(name) {                               // an account by username: online first, then the sign-in records
   const lower = name.toLowerCase();
   for (const p of byUid.values()) if (p.name.toLowerCase() === lower) return { uid: p.uid, name: p.name };
+  const inRL = rlCall(x => x.findByName(lower), null); if (inRL) return inRL;
   if (knownNames.has(lower)) return { uid: knownNames.get(lower), name };
   if (db && admin) {
     try { const u = await admin.auth().getUserByEmail(lower + '@' + EMAIL_DOMAIN); return { uid: u.uid, name: u.displayName || name }; }
@@ -642,6 +643,7 @@ async function onAdmin(req, res) {
   if (req.method === 'GET' && req.url === '/admin/players') {
     const list = [];
     for (const p of byUid.values()) if (p.room) list.push({ name: p.name, room: p.room.isPublic ? 'Public' : p.room.code, kills: p.kills, owner: COS.isOwner(p.name) });
+    for (const r of rlCall(x => x.list(), [])) list.push(Object.assign(r, { owner: COS.isOwner(r.name) }));
     return adminSend(res, 200, { players: list.sort((a, b) => a.name.localeCompare(b.name)) });
   }
   if (req.method !== 'POST' || !['/admin/ban', '/admin/unban'].includes(req.url)) return adminSend(res, 404, { error: 'Unknown request.' });
@@ -654,8 +656,10 @@ async function onAdmin(req, res) {
   if (req.url === '/admin/ban') {
     modRec.set(acct.uid, { banned: true, tamperAt: Date.now() });
     if (db) await db.ref('users/' + acct.uid + '/mod').update({ banned: true, bannedAt: admin.database.ServerValue.TIMESTAMP, bannedBy: me.name }).catch(e => console.warn('ban write failed', e.message));
-    const p = byUid.get(acct.uid), online = !!p;
+    const p = byUid.get(acct.uid);
     if (p) { send(p, { t: 'err', code: 'banned' }); if (p.room) leaveRoom(p, 'banned'); setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 300); }
+    const kickedRL = !!rlCall(x => x.kick(acct.uid, 'banned'), false);                                     // kicked out of RockLeague too
+    const online = !!p || kickedRL;
     console.log(`${me.name} banned ${acct.name}${online ? ' (kicked from the match)' : ''}`);
     return adminSend(res, 200, { ok: true, name: acct.name, online, msg: online ? `${acct.name} is banned and was kicked.` : `${acct.name} is banned.` });
   }
@@ -665,8 +669,25 @@ async function onAdmin(req, res) {
   return adminSend(res, 200, { ok: true, name: acct.name, msg: `${acct.name} is unbanned.` });
 }
 
+/* ---------- RockLeague (the arcade's car football game) ----------
+   It lives in its own file with its own connections and game loop. If it ever fails to load or
+   throws, Baseplate FPS carries on exactly as before. */
+let RL = null;
+try {
+  RL = require('./rockleague.js')({ admin, getDb: () => db, verifyToken, modRec, knownNames, USER_RE, EMAIL_DOMAIN, DEV_TOKENS });
+  console.log('RockLeague is running on /rl');
+} catch (e) { console.error('RockLeague failed to start (Baseplate FPS is unaffected):', e && e.message); }
+const rlCall = (fn, dflt) => { try { return RL ? fn(RL) : dflt; } catch (e) { console.error('[rockleague]', e && e.message); return dflt; } };
+
 const server = http.createServer((req, res) => {
   if (req.url === '/health') { res.writeHead(200, { 'content-type': 'text/plain' }); res.end('ok'); return; }
+  if (req.url === '/status') {                                   // the arcade page shows how many are playing
+    let n = 0; for (const r of rooms.values()) n += r.players.size;
+    const pub = rooms.get('PUBLIC');
+    res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*', 'cache-control': 'no-store' });
+    res.end(JSON.stringify({ players: n, public: { players: pub.players.size, mode: pub.mode, map: pub.map, phase: pub.phase }, rockleague: rlCall(r => r.status(), null) }));
+    return;
+  }
   if (req.url.startsWith('/admin/')) {
     if (req.method === 'OPTIONS') {
       res.writeHead(204, { 'access-control-allow-origin': '*', 'access-control-allow-headers': 'authorization, content-type', 'access-control-allow-methods': 'GET, POST', 'access-control-max-age': '600' });
@@ -682,7 +703,13 @@ const server = http.createServer((req, res) => {
   const pub = rooms.get('PUBLIC');
   res.end(`Baseplate FPS game server is running. ${players} playing right now. Public match: ${MODE_NAMES[pub.mode]} on ${mapOf(pub).name} (${pub.phase}).\n`);
 });
-const wss = new WebSocketServer({ server, maxPayload: 8 * 1024 });
+const wss = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 });
+server.on('upgrade', (req, socket, head) => {
+  socket.on('error', () => {});
+  const path = String(req.url || '/').split('?')[0];
+  if (path === '/rl') { if (RL) RL.handleUpgrade(req, socket, head); else socket.destroy(); return; }   // RockLeague
+  wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));                         // Baseplate FPS (every other path, as before)
+});
 
 wss.on('connection', ws => {
   const p = { id: nextId++, ws, uid: '', name: '', authed: false, room: null, loadout: WEAPON_LIST.slice(), cos: '',
