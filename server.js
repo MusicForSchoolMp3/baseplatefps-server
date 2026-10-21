@@ -674,7 +674,7 @@ async function onAdmin(req, res) {
    throws, Baseplate FPS carries on exactly as before. */
 let RL = null;
 try {
-  RL = require('./rockleague.js')({ admin, getDb: () => db, verifyToken, modRec, knownNames, USER_RE, EMAIL_DOMAIN, DEV_TOKENS });
+  RL = require('./rockleague.js')({ admin, getDb: () => db, verifyToken, modRec, knownNames, USER_RE, EMAIL_DOMAIN, DEV_TOKENS, isOwner: n => COS.isOwner(n) });
   console.log('RockLeague is running on /rl');
 } catch (e) { console.error('RockLeague failed to start (Baseplate FPS is unaffected):', e && e.message); }
 const rlCall = (fn, dflt) => { try { return RL ? fn(RL) : dflt; } catch (e) { console.error('[rockleague]', e && e.message); return dflt; } };

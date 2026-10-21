@@ -12,7 +12,7 @@
 const { WebSocketServer } = require('ws');
 const P = require('./rl-physics.js');
 
-const RL_PROTO = 1;
+const RL_PROTO = 3;
 const MATCH_S = 300;                     // five minute matches
 const COUNT_S = 3;                       // kickoff countdown
 const GOAL_S = 3;                        // celebration after a goal
@@ -27,6 +27,7 @@ const STAT_KEYS = ['played', 'wins', 'losses', 'goals', 'shots', 'saves', 'demos
 
 module.exports = function createRockLeague(ctx) {
   const { verifyToken, modRec, knownNames, USER_RE, EMAIL_DOMAIN, DEV_TOKENS } = ctx;
+  const isOwner = typeof ctx.isOwner === 'function' ? ctx.isOwner : () => false;
   const getDb = () => ctx.getDb();
   const admin = ctx.admin;
   const wss = new WebSocketServer({ noServer: true, maxPayload: 4096 });
@@ -105,7 +106,7 @@ module.exports = function createRockLeague(ctx) {
   function seat(room, p, team) {
     room.seats[team] = p; p.room = room; p.team = team;
     p.q = []; p.ack = p.lastSeq; p.last = P.IDLE; p.starve = 0;
-    const c = P.newCar(p.cid, team);
+    const c = P.newCar(p.cid, team); c.pw = p.power ? 1 : 0;
     room.world.cars = room.world.cars.filter(x => x.id !== p.cid).concat(c);
     room.world.cars.sort((a, b) => a.team - b.team);
     const s = room.seats[1 - team];
@@ -129,8 +130,9 @@ module.exports = function createRockLeague(ctx) {
   }
   function leaveRoom(p, why) {
     const room = p.room; if (!room) return;
-    p.room = null;
+    p.room = null; p.frozen = false;
     room.seats[p.team] = null;
+    if (p.owner) for (const o of seated(room)) o.frozen = false;   // the owner leaving unfreezes everyone
     room.world.cars = room.world.cars.filter(c => c.id !== p.cid);
     const other = seated(room)[0];
     const live = room.phase === 'count' || room.phase === 'play' || room.phase === 'goal';
@@ -179,6 +181,7 @@ module.exports = function createRockLeague(ctx) {
   function tickRoom(room) {
     const w = room.world, inputs = {};
     for (const p of seated(room)) {
+      const car = w.cars.find(c => c.id === p.cid); if (car) { car.pw = p.power ? 1 : 0; car.fz = p.frozen ? 1 : 0; }   // only the server decides who has super powers or is frozen
       let inp;
       if (p.q.length) { const e = p.q.shift(); p.ack = e.s; p.last = e.inp; p.starve = 0; inp = e.inp; }
       else { p.starve++; inp = p.starve > STARVE_IDLE ? P.IDLE : p.last; }
@@ -270,9 +273,13 @@ module.exports = function createRockLeague(ctx) {
     const old = byUid.get(who.uid);
     if (old && old !== p) { send(old, { t: 'err', code: 'elsewhere' }); if (old.room) leaveRoom(old, 'left'); unqueue(old); try { old.ws.close(); } catch (_) {} }
     p.uid = who.uid; p.name = prof.name; p.authed = true; byUid.set(p.uid, p);
+    // owner: matched against the email Google verified, so nobody can claim it from their browser
+    const fromEmail = String(who.email).split('@')[0].toLowerCase();
+    p.owner = String(who.email).toLowerCase() === fromEmail + '@' + EMAIL_DOMAIN && isOwner(fromEmail);
+    p.power = false; p.frozen = false; p.flipAt = 0;
     if (knownNames) knownNames.set(prof.name.toLowerCase(), p.uid);
     setCar(p, msg.car);
-    send(p, { t: 'welcome', id: p.cid, name: p.name, stats: prof.stats, proto: RL_PROTO });
+    send(p, { t: 'welcome', id: p.cid, name: p.name, stats: prof.stats, proto: RL_PROTO, owner: p.owner });
   }
   function setCar(p, car) {
     const c = car && typeof car === 'object' ? car : {};
@@ -341,6 +348,35 @@ module.exports = function createRockLeague(ctx) {
         break;
       }
       case 'leave': if (p.room) leaveRoom(p, 'left'); unqueue(p); send(p, { t: 'menu' }); break;
+      case 'power': {                                     // owner super powers on / off
+        if (!p.owner) return;                             // everyone else is simply ignored
+        p.power = !p.power;
+        if (p.room) { const car = p.room.world.cars.find(c => c.id === p.cid); if (car) car.pw = p.power ? 1 : 0; broadcast(p.room, { t: 'power', id: p.cid, name: p.name, on: p.power }); }
+        else send(p, { t: 'power', id: p.cid, name: p.name, on: p.power });
+        break;
+      }
+      case 'freeze': case 'flip': {                       // owner only: freeze the other player, or flip them about
+        if (!p.owner || !p.room) return;
+        const room = p.room, others = seated(room).filter(o => o !== p);
+        if (!others.length) return;
+        if (msg.t === 'freeze') {
+          const on = !others.every(o => o.frozen);
+          for (const o of others) o.frozen = on;
+          for (const o of others) { const car = room.world.cars.find(c => c.id === o.cid); if (car) car.fz = on ? 1 : 0; }
+          broadcast(room, { t: 'troll', kind: on ? 'freeze' : 'unfreeze', by: p.name, victims: others.map(o => o.cid) });
+        } else {
+          if (now - p.flipAt < 250) return; p.flipAt = now;
+          for (const o of others) {
+            const car = room.world.cars.find(c => c.id === o.cid); if (!car || car.demoT > 0) continue;
+            if (o.frozen) { o.frozen = false; car.fz = 0; }
+            const r = () => Math.random() * 2 - 1;
+            car.v = [car.v[0] + r() * 4, Math.max(car.v[1], 0) + 6 + Math.random() * 4, car.v[2] + r() * 4];
+            car.w = [r() * 9, r() * 6, r() * 9]; car.lock = 12; car.jumped = 1; car.dj = 1; car.holdT = P.CAR.holdT;
+          }
+          broadcast(room, { t: 'troll', kind: 'flip', by: p.name, victims: others.map(o => o.cid) });
+        }
+        break;
+      }
       case 'dbg': {                                       // local testing only: DEV_TOKENS is never set on Render
         if (!DEV_TOKENS || !p.room) return;
         const nums = a => Array.isArray(a) && a.length === 3 && a.every(v => typeof v === 'number' && isFinite(v));
