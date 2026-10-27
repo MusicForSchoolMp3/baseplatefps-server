@@ -2,7 +2,7 @@
   "name": "baseplatefps-server",
   "version": "1.0.0",
   "private": true,
-  "description": "Game server for Baseplate Arcade: Baseplate FPS and RockLeague",
+  "description": "Game server for Baseplate Arcade: Baseplate FPS, RockLeague and othercolourbike",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"

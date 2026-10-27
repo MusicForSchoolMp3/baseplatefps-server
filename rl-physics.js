@@ -17,6 +17,7 @@
     dodgeV: 5.0, backDodgeV: 5.33, flipT: 0.65, flipW: 10.6, maxW: 5.5,
     stick: 3.25, grip: 22, slideGrip: 2.5, align: 30,
     massRatio: 6,                            // a car is six times heavier than the ball
+    powerV: 46,                              // top speed with the owner's super powers on
   };
   const INERTIA = [(CAR.hy * CAR.hy + CAR.hz * CAR.hz) / 3, (CAR.hx * CAR.hx + CAR.hz * CAR.hz) / 3, (CAR.hx * CAR.hx + CAR.hy * CAR.hy) / 3];
   const CORNERS = [];
@@ -78,7 +79,7 @@
   /* ---------- world state ---------- */
   function newCar(id, team) {
     return { id, team, p: [0, CAR.ride, 0], q: [0, 0, 0, 1], v: [0, 0, 0], w: [0, 0, 0], boost: 33.3,
-      jumped: 0, jumpT: 0, holdT: 0, dj: 0, dodgeT: -1, dax: [0, 0, 0], airT: 0, lock: 0, prevJump: 0, demoT: 0, ground: 0, bodyT: 0, nrm: [0, 1, 0] };
+      jumped: 0, jumpT: 0, holdT: 0, dj: 0, dodgeT: -1, dax: [0, 0, 0], airT: 0, lock: 0, prevJump: 0, demoT: 0, ground: 0, bodyT: 0, nrm: [0, 1, 0], pw: 0, fz: 0 };
   }
   function newWorld() {
     return { tick: 0, ball: { p: [0, BALL.r, 0], v: [0, 0, 0], w: [0, 0, 0] }, cars: [], pads: PADS.map(() => 0) };
@@ -89,13 +90,13 @@
       const [sx, sz] = KICKOFFS[spotIndex % KICKOFFS.length];
       const x = c.team === 0 ? sx : -sx, z = c.team === 0 ? sz : -sz;
       const yaw = Math.atan2(-x, -z);             // face the ball
-      Object.assign(c, newCar(c.id, c.team), { p: [x, CAR.ride, z], q: qFromYaw(yaw), boost: 33.3 });
+      Object.assign(c, newCar(c.id, c.team), { p: [x, CAR.ride, z], q: qFromYaw(yaw), boost: 33.3, pw: c.pw || 0, fz: c.fz || 0 });
     }
     world.pads = PADS.map(() => 0);
   }
   function respawn(c, tick) {
     const s = c.team === 0 ? -1 : 1, side = (tick | 0) % 2 ? -1 : 1;
-    Object.assign(c, newCar(c.id, c.team), { p: [side * 24, CAR.ride, s * 46], q: qFromYaw(s < 0 ? 0 : Math.PI), boost: 33.3 });
+    Object.assign(c, newCar(c.id, c.team), { p: [side * 24, CAR.ride, s * 46], q: qFromYaw(s < 0 ? 0 : Math.PI), boost: 33.3, pw: c.pw || 0, fz: c.fz || 0 });
   }
 
   /* ---------- one car for one step ---------- */
@@ -121,6 +122,7 @@
   }
   function stepCar(c, inp, dt, tick, events) {
     if (c.demoT > 0) { c.demoT -= dt; if (c.demoT <= 0) { respawn(c, tick); events.push({ t: 'respawn', id: c.id }); } return; }
+    if (c.fz) { c.v = [0, 0, 0]; c.w = [0, 0, 0]; c.prevJump = inp.jump ? 1 : 0; return; }   // frozen solid by the owner: can't move at all
     const fwd = rot(c.q, [0, 0, 1]), up = rot(c.q, [0, 1, 0]), left = rot(c.q, [1, 0, 0]);
     const a = [0, -G, 0];
     const jumpPressed = inp.jump && !c.prevJump;
@@ -131,6 +133,13 @@
     const d = inside(c.p[0], c.p[1], c.p[2]), n = normalAt(c.p[0], c.p[1], c.p[2]);
     const grounded = c.lock <= 0 && d < CAR.ride + CAR.reach && dot(up, n) > 0.55 && dot(c.v, n) < 1.5;
     c.ground = grounded ? 1 : 0;
+    // super powers (the owner only, switched on by the server): double speed, endless boost,
+    // flying (hardly any gravity in the air) and as many jumps as you like
+    const pw = c.pw === 1;
+    if (pw) {
+      c.boost = 100;
+      if (!grounded) { a[1] += G * 0.88; c.dj = 0; c.jumpT = 0; c.airT = 0; }
+    }
     if (grounded) {
       c.nrm = n;
       c.jumped = 0; c.dj = 0; c.dodgeT = -1; c.airT = 0; c.holdT = 0;
@@ -141,7 +150,7 @@
       const fS = norm(sub(fwd, mul(n, dot(fwd, n))));
       const vf = dot(c.v, fS), sp = Math.abs(vf);
       if (Math.abs(inp.thr) > 0.01 && vf * inp.thr < -0.05) addTo(a, fS, -Math.sign(vf) * CAR.brake * Math.min(1, Math.abs(inp.thr)));
-      else if (Math.abs(inp.thr) > 0.01) addTo(a, fS, throttleAcc(sp) * inp.thr);
+      else if (Math.abs(inp.thr) > 0.01) addTo(a, fS, (pw ? (sp < 32 ? 38 : 0) : throttleAcc(sp)) * inp.thr);
       else if (sp > 0.01) addTo(a, fS, -Math.sign(vf) * Math.min(CAR.coast, sp / dt));
       // tyres: kill sideways slip (much less when power-sliding)
       const lat = sub(sub(c.v, mul(n, dot(c.v, n))), mul(fS, vf));
@@ -162,11 +171,11 @@
       const dodging = c.dodgeT >= 0 && c.dodgeT < CAR.flipT;
       const pitch = dodging ? 0 : (inp.pitch || 0), yaw = dodging ? 0 : (inp.yaw || 0), roll = dodging ? 0 : (inp.roll || 0);
       const al = [12.46 * pitch - 2.798 * wl[0] * (1 - Math.abs(pitch)), -9.11 * yaw - 1.886 * wl[1] * (1 - Math.abs(yaw)), 38.34 * roll - 4.47 * wl[2]];
-      if (!dodging) addTo(c.w, rot(c.q, al), dt);
+      if (!dodging) addTo(c.w, rot(c.q, al), dt * (pw ? 1.5 : 1));
       if (Math.abs(inp.thr) > 0.01) addTo(a, fwd, CAR.airThrottle * inp.thr);
     }
     // boost
-    if (inp.boost && c.boost > 0) { addTo(a, fwd, CAR.boostAcc); c.boost = Math.max(0, c.boost - CAR.boostUse * dt); }
+    if (inp.boost && c.boost > 0) { addTo(a, fwd, CAR.boostAcc * (pw ? 3 : 1)); if (!pw) c.boost = Math.max(0, c.boost - CAR.boostUse * dt); }
     // jumping, double jumps, dodges, and getting back on your wheels
     if (c.jumped) { c.jumpT += dt; if (!inp.jump) c.holdT = CAR.holdT; }   // letting go of jump ends the high jump
     if (grounded && jumpPressed) {
@@ -207,7 +216,7 @@
     }
     // integrate
     addTo(c.v, a, dt);
-    const sp = len(c.v); if (sp > CAR.maxV) c.v = mul(c.v, CAR.maxV / sp);
+    const vMax = pw ? CAR.powerV : CAR.maxV, sp = len(c.v); if (sp > vMax) c.v = mul(c.v, vMax / sp);
     const wMax = c.dodgeT >= 0 && c.dodgeT < CAR.flipT ? CAR.flipW : CAR.maxW, ws = len(c.w); if (ws > wMax && !grounded) c.w = mul(c.w, wMax / ws);
     addTo(c.p, c.v, dt); qIntegrate(c.q, c.w, dt);
     // the body itself: keep every corner of the hitbox inside the arena, bouncing off like a solid box
@@ -267,6 +276,7 @@
     if (dist > 1e-6) nl = mul(dl, 1 / dist);
     else { const ex = [CAR.hx - Math.abs(l[0]), CAR.hy - Math.abs(l[1]), CAR.hz - Math.abs(l[2])], i = ex.indexOf(Math.min(...ex)); nl = [0, 0, 0]; nl[i] = Math.sign(l[i]) || 1; }
     const n = rot(c.q, nl), pen = BALL.r - dist;
+    if (c.fz) { addTo(b.p, n, pen); const vn0 = dot(b.v, n); if (vn0 < 0) { addTo(b.v, n, -vn0 * 1.6); events.push({ t: 'touch', id: c.id, s: -vn0, p: b.p.slice() }); } return; }   // a frozen car is a block of ice
     const m = CAR.massRatio;
     addTo(b.p, n, pen * m / (m + 1)); addTo(c.p, n, -pen / (m + 1));
     const rc = rot(c.q, cl), vcp = add(c.v, cross(c.w, rc));
@@ -365,14 +375,14 @@
   const R4 = v => Math.round(v * 10000) / 10000;
   function packCar(c) {
     return [c.id, c.team, ...c.p.map(R4), ...c.q.map(R4), ...c.v.map(R4), ...c.w.map(R4), R4(c.boost), c.jumped, R4(c.jumpT), R4(c.holdT), c.dj,
-      R4(c.dodgeT), ...c.dax.map(R4), R4(c.airT), c.lock, c.prevJump, R4(c.demoT), c.ground, R4(c.bodyT), ...c.nrm.map(R4)];
+      R4(c.dodgeT), ...c.dax.map(R4), R4(c.airT), c.lock, c.prevJump, R4(c.demoT), c.ground, R4(c.bodyT), ...c.nrm.map(R4), c.pw ? 1 : 0, c.fz ? 1 : 0];
   }
   function unpackCar(a) {
     let i = 0; const g = () => a[i++];
     const c = newCar(g(), g());
     c.p = [g(), g(), g()]; c.q = [g(), g(), g(), g()]; c.v = [g(), g(), g()]; c.w = [g(), g(), g()]; c.boost = g();
     c.jumped = g(); c.jumpT = g(); c.holdT = g(); c.dj = g(); c.dodgeT = g(); c.dax = [g(), g(), g()]; c.airT = g(); c.lock = g(); c.prevJump = g(); c.demoT = g();
-    c.ground = g(); c.bodyT = g(); c.nrm = [g(), g(), g()];
+    c.ground = g(); c.bodyT = g(); c.nrm = [g(), g(), g()]; c.pw = g() === 1 ? 1 : 0; c.fz = g() === 1 ? 1 : 0;
     qNorm(c.q);
     return c;
   }

@@ -1,4 +1,4 @@
-# Baseplate Arcade game server (Baseplate FPS + RockLeague)
+# Baseplate Arcade game server (Baseplate FPS + RockLeague + othercolourbike)
 
 Runs every match: the big public match and private matches with codes. Each round is free for all,
 team deathmatch or last man standing; players vote on the next map and mode between rounds. It checks
@@ -28,3 +28,14 @@ carry on as normal. `rl-physics.js` is the car and ball physics and MUST match t
 The server runs every match at 120 steps a second and decides every touch, goal and demolition. Stats are saved
 to users/<uid>/rockleague/stats, which players can't write. Bans from the Moderation screen kick people out of
 RockLeague too. The arcade page reads /status to show how many people are playing each game.
+
+Super powers (RockLeague): an owner (Ben) presses 9 in a match to switch on super speed, flying and endless jumps.
+The server checks the owner's verified sign-in and runs the powers itself, so nobody else can switch them on.
+In a match the owner can also press 3 to freeze the other player (3 again unfreezes) and 5 to flip them about.
+
+othercolourbike (the mountain bike game) also runs on this server, on the `/ocb` path, in `othercolourbike.js`, with its own
+connections, so it can't affect the other games. `ocb-physics.js` holds the bike physics and the trails and MUST match the copy
+in the website's othercolourbike folder. The bike park (public, or private with a code) is relayed here. Leaderboard runs are
+sent as the controls pressed on every physics step; the server rides the run again itself and only saves the time and score
+it gets, so times can't be faked. Progress is saved to users/<uid>/ocb/progress and leaderboards to ocb/boards (players can't
+write either). Bans kick people out of othercolourbike too.
