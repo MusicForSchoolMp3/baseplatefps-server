@@ -85,7 +85,7 @@ module.exports = function createRockLeague(ctx) {
   }
   function newRoom(isPrivate) {
     if (rooms.size >= MAX_ROOMS) return null;
-    const room = { id: nextRoom++, code: isPrivate ? makeCode() : null, isPrivate, seats: [null, null], world: P.newWorld(), phase: 'wait', pt: 0,
+    const room = { id: nextRoom++, code: isPrivate ? makeCode() : null, isPrivate, seats: [null, null], watchers: new Set(), world: P.newWorld(), phase: 'wait', pt: 0,
       clock: MATCH_S * 120, ot: false, score: [0, 0], ev: [], lastTouch: null, st: {}, rematch: new Set(), zeroWait: 0, startTick: 0, forfeit: null, mvp: null };
     if (isPrivate && !room.code) return null;
     room.world.ball.p = [0, P.BALL.r, 0];
@@ -102,7 +102,7 @@ module.exports = function createRockLeague(ctx) {
     return { t: 'room', code: room.code, priv: room.isPrivate, phase: room.phase,
       seats: room.seats.map(p => p ? { id: p.cid, name: p.name, team: p.team, body: p.car.body, accent: p.car.accent } : null) };
   }
-  function broadcast(room, obj) { const s = JSON.stringify(obj); for (const p of seated(room)) send(p, s); }
+  function broadcast(room, obj) { const s = JSON.stringify(obj); for (const p of seated(room)) send(p, s); for (const w of room.watchers) send(w, s); }
   function seat(room, p, team) {
     room.seats[team] = p; p.room = room; p.team = team;
     p.q = []; p.ack = p.lastSeq; p.last = P.IDLE; p.starve = 0;
@@ -130,6 +130,7 @@ module.exports = function createRockLeague(ctx) {
   }
   function leaveRoom(p, why) {
     const room = p.room; if (!room) return;
+    for (const w of room.watchers) if (w.watchTarget === p) { room.watchers.delete(w); send(w, { t: 'err', code: 'watchend' }); }
     p.room = null; p.frozen = false;
     room.seats[p.team] = null;
     if (p.owner) for (const o of seated(room)) o.frozen = false;   // the owner leaving unfreezes everyone
@@ -247,6 +248,7 @@ module.exports = function createRockLeague(ctx) {
       c: w.cars.map(P.packCar), b: P.packBall(w.ball), pd: w.pads.map(v => Math.round(v * 10) / 10), li, ev: room.ev };
     room.ev = [];
     for (const p of seated(room)) { base.a = p.ack; base.qd = p.q.length; send(p, base); }
+    if (room.watchers.size) { base.a = 0; base.qd = 0; const s = JSON.stringify(base); for (const w of room.watchers) send(w, s); }
   }
   let last = Date.now(), acc = 0;
   setInterval(safe(() => {
@@ -270,6 +272,16 @@ module.exports = function createRockLeague(ctx) {
     const prof = await loadProfile(who);
     if (p.ws.readyState !== 1) return;
     if (prof.banned) { send(p, { t: 'err', code: 'banned' }); setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 400); return; }
+    // the owner watching someone, unseen: checked against the verified sign-in, never anything the browser says
+    if (typeof msg.watch === 'string' && msg.watch) {
+      if (!ctx.isOwnerWho || !ctx.isOwnerWho(who)) { send(p, { t: 'err', code: 'auth' }); setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 300); return; }
+      const lower = msg.watch.toLowerCase().slice(0, 20);
+      let t = null; for (const q of byUid.values()) if (q.name.toLowerCase() === lower && !q.watcher) t = q;
+      p.uid = who.uid; p.name = prof.name; p.authed = true; p.watcher = true;
+      send(p, { t: 'welcome', id: t ? t.cid : '', name: p.name, stats: {}, proto: RL_PROTO, owner: false, watch: t && t.room ? 1 : 0, wname: t ? t.name : '' });
+      if (t && t.room) { p.watchTarget = t; p.watchRoom = t.room; t.room.watchers.add(p); send(p, roomInfo(t.room)); }
+      return;
+    }
     const old = byUid.get(who.uid);
     if (old && old !== p) { send(old, { t: 'err', code: 'elsewhere' }); if (old.room) leaveRoom(old, 'left'); unqueue(old); try { old.ws.close(); } catch (_) {} }
     p.uid = who.uid; p.name = prof.name; p.authed = true; byUid.set(p.uid, p);
@@ -302,6 +314,7 @@ module.exports = function createRockLeague(ctx) {
     let msg; try { msg = JSON.parse(raw); } catch (_) { return; }
     if (!msg || typeof msg !== 'object') return;
     if (!p.authed) { if (msg.t === 'hello' && !p.helloSeen) { p.helloSeen = true; onHello(p, msg).catch(e => { console.error('[rockleague] hello', e); try { p.ws.close(); } catch (_) {} }); } return; }
+    if (p.watcher) return;                                  // watchers only watch
     switch (msg.t) {
       case 'i': onInputs(p, msg); break;
       case 'car': if (!p.room) setCar(p, msg.car); break;
@@ -402,6 +415,7 @@ module.exports = function createRockLeague(ctx) {
     ws.on('message', safe(raw => onMessage(p, raw), 'message'));
     ws.on('close', safe(() => {
       clearTimeout(helloTimer); players.delete(p); unqueue(p);
+      if (p.watcher) { if (p.watchRoom) p.watchRoom.watchers.delete(p); return; }
       if (p.room) leaveRoom(p, 'disconnected');
       if (byUid.get(p.uid) === p) byUid.delete(p.uid);
     }, 'close'));
@@ -422,9 +436,9 @@ module.exports = function createRockLeague(ctx) {
     },
     status() {
       let inMatch = 0; for (const r of rooms.values()) inMatch += seated(r).length;
-      return { players: [...players].filter(p => p.authed).length, inMatch, queue: queue.length, matches: rooms.size };
+      return { players: [...players].filter(p => p.authed && !p.watcher).length, inMatch, queue: queue.length, matches: rooms.size };
     },
-    list() { return [...players].filter(p => p.authed).map(p => ({ name: p.name, room: p.room ? (p.room.code ? 'RockLeague ' + p.room.code : 'RockLeague') : 'RockLeague menu', kills: 0, owner: false })); },
+    list() { return [...players].filter(p => p.authed && !p.watcher).map(p => ({ name: p.name, room: p.room ? (p.room.code ? 'RockLeague ' + p.room.code : 'RockLeague') : 'RockLeague menu', kills: 0, owner: false })); },
     findByName(lower) { for (const p of byUid.values()) if (p.name.toLowerCase() === lower) return { uid: p.uid, name: p.name }; return null; },
     kick(uid, code) {
       const p = byUid.get(uid); if (!p) return false;

@@ -152,7 +152,7 @@ module.exports = function createOCB(ctx) {
   }
   const num = (v, lo, hi) => typeof v === 'number' && isFinite(v) ? Math.min(hi, Math.max(lo, v)) : 0;
   function onState(p, m) {
-    if (!p.park) return;
+    p.lv = m.lv === 'park' || LEVEL_IDS.includes(m.lv) ? m.lv : p.park ? 'park' : null; p.stAt = Date.now();   // kept for the owner's hidden watching too
     // where you are and what you're doing; anything odd is clamped (in the park there's nothing to win anyway)
     p.st = [p.cid, Math.round(num(m.x, -100, 2000) * 100) / 100, Math.round(num(m.y, -500, 500) * 100) / 100, Math.round(num(m.a, -1e4, 1e4) * 1000) / 1000,
       Math.round(num(m.sp, -100, 100) * 100) / 100, num(m.tr, 0, 8) | 0, Math.round(num(m.tp, 0, 1) * 100) / 100, num(m.f, 0, 255) | 0,
@@ -164,6 +164,17 @@ module.exports = function createOCB(ctx) {
       const all = [...r.players].filter(q => q.st).map(q => q.st);
       for (const q of r.players) send(q, { t: 'ps', p: all.filter(e => e[0] !== q.cid) });
     }
+    // the owner watching someone: where they are (a trail or the park) and everyone riding with them
+    for (const w of players) {
+      if (!w.watcher) continue;
+      const t = w.watchTarget;
+      if (!t || !players.has(t)) { send(w, { t: 'wst', gone: 1 }); continue; }
+      const live = t.st && t.lv && Date.now() - (t.stAt || 0) < 4000;
+      if (!live) { send(w, { t: 'wst', lv: null }); continue; }
+      const with_ = t.park ? [...t.park.players].filter(q => q.st && q !== t) : [];
+      const n = {}; for (const q of [t, ...with_]) n[q.cid] = [q.name, q.kit, q.bike];
+      send(w, { t: 'wst', lv: t.lv, id: t.cid, p: [t.st, ...with_.map(q => q.st)], n });
+    }
   }, 'park'), 1000 / SEND_HZ);
 
   /* ---------- messages ---------- */
@@ -173,6 +184,14 @@ module.exports = function createOCB(ctx) {
     const prof = await loadProfile(who);
     if (p.ws.readyState !== 1) return;
     if (prof.banned) { send(p, { t: 'err', code: 'banned' }); setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 400); return; }
+    if (typeof msg.watch === 'string' && msg.watch) {           // the owner watching someone, unseen (checked against the verified sign-in)
+      if (!ctx.isOwnerWho || !ctx.isOwnerWho(who)) { send(p, { t: 'err', code: 'auth' }); setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 300); return; }
+      const lower = msg.watch.toLowerCase().slice(0, 20);
+      let t = null; for (const q of byUid.values()) if (q.name.toLowerCase() === lower && !q.watcher) t = q;
+      p.uid = who.uid; p.name = prof.name; p.authed = true; p.watcher = true; p.watchTarget = t;
+      send(p, { t: 'welcome', id: p.cid, name: p.name, progress: {}, proto: OCB_PROTO, watch: t ? t.cid : 0, wname: t ? t.name : '' });
+      return;
+    }
     const old = byUid.get(who.uid);
     if (old && old !== p) { send(old, { t: 'err', code: 'elsewhere' }); leavePark(old); try { old.ws.close(); } catch (_) {} }
     p.uid = who.uid; p.name = prof.name; p.authed = true; byUid.set(p.uid, p);
@@ -187,6 +206,7 @@ module.exports = function createOCB(ctx) {
     let msg; try { msg = JSON.parse(raw); } catch (_) { return; }
     if (!msg || typeof msg !== 'object') return;
     if (!p.authed) { if (msg.t === 'hello' && !p.helloSeen) { p.helloSeen = true; onHello(p, msg).catch(e => { console.error('[othercolourbike] hello', e); try { p.ws.close(); } catch (_) {} }); } return; }
+    if (p.watcher) return;                                // watchers only watch
     switch (msg.t) {
       case 's': onState(p, msg); break;
       case 'run': onRun(p, msg).catch(e => console.error('[othercolourbike] run', e)); break;
@@ -229,9 +249,9 @@ module.exports = function createOCB(ctx) {
     },
     status() {
       let inPark = 0; for (const r of parks.values()) inPark += r.players.size;
-      return { players: [...players].filter(p => p.authed).length, inPark, publicPark: (parks.get('PUBLIC') || { players: new Set() }).players.size };
+      return { players: [...players].filter(p => p.authed && !p.watcher).length, inPark, publicPark: (parks.get('PUBLIC') || { players: new Set() }).players.size };
     },
-    list() { return [...players].filter(p => p.authed).map(p => ({ name: p.name, room: p.park ? (p.park.code === 'PUBLIC' ? 'Bike park' : 'Bike park ' + p.park.code) : 'othercolourbike', kills: 0, owner: false })); },
+    list() { return [...players].filter(p => p.authed && !p.watcher).map(p => ({ name: p.name, room: p.park ? (p.park.code === 'PUBLIC' ? 'Bike park' : 'Bike park ' + p.park.code) : 'othercolourbike', kills: 0, owner: false })); },
     findByName(lower) { for (const p of byUid.values()) if (p.name.toLowerCase() === lower) return { uid: p.uid, name: p.name }; return null; },
     kick(uid, code) {
       const p = byUid.get(uid); if (!p) return false;

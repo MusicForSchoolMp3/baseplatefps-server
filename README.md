@@ -1,4 +1,4 @@
-# Baseplate Arcade game server (Baseplate FPS + RockLeague + othercolourbike + SwellSurf)
+# Baseplate Arcade game server (Baseplate FPS + RockLeague + othercolourbike + SwellSurf + Highway Bike)
 
 Runs every match: the big public match and private matches with codes. Each round is free for all,
 team deathmatch or last man standing; players vote on the next map and mode between rounds. It checks
@@ -46,3 +46,12 @@ website's swellsurf folder. Beaches (up to 6 surfers on the same waves, open or 
 here. Every scored wave is sent as where the surfer was just before it plus the controls pressed on every physics step; the
 server surfs the wave again itself and only saves or counts the score it gets, so scores can't be faked. Best waves are saved
 to users/<uid>/surf/best and leaderboards to surf/boards (players can't write either). Bans kick people out of SwellSurf too.
+
+Highway Bike (the motorbike game) also runs on this server, on the `/hb` path, in `highwaybike.js`, with its own connections,
+so it can't affect the other games. `hb-sim.js` holds the road (lanes, ramps) and the traffic drivers and MUST match the copy in
+the website's highwaybike folder. Public highways take up to 20 riders each; the traffic runs here so everyone on a highway
+sees the same cars and the same crashes, and the riders list teleports you near anyone. Bans kick people out of it too.
+
+The owner panel (ban, unban, see who's playing, and watch anyone in any game without being seen) is in `admin-panel.js`. It is
+only ever sent to the owner's signed-in arcade page after the server checks the Google-verified sign-in, and every action it
+takes is checked again on the server, so nobody else can see it or use it.

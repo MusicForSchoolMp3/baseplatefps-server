@@ -160,7 +160,7 @@ module.exports = function createSurf(ctx) {
   function broadcastContest(r) { const v = contestView(r.contest); for (const q of r.players) send(q, { t: 'contest', c: v }); }
   function sys(r, x) { r.chat.push({ n: '', x }); if (r.chat.length > 10) r.chat.shift(); for (const q of r.players) send(q, { t: 'sys', x }); }
   function onState(p, m) {
-    if (!p.room) return;
+    p.tt = num(m.tt, 0, 1e7); p.stAt = Date.now();                 // kept (in rooms or alone) for the owner's hidden watching
     const md = m.m === 9 ? 9 : Math.max(0, Math.min(4, m.m | 0));
     p.st = [p.cid, Math.round(num(m.x, -800, 800) * 100) / 100, Math.round(num(m.y, -20, 60) * 100) / 100, Math.round(num(m.z, -400, 500) * 100) / 100, Math.round(num(m.yaw, -1e5, 1e5) * 1000) / 1000,
       Math.round(num(m.pitch, -1e4, 1e4) * 1000) / 1000, Math.round(num(m.roll, -1e4, 1e4) * 1000) / 1000, md, num(m.f, 0, 255) | 0, Math.round(num(m.sph, 0, 1) * 100) / 100, Math.round(num(m.wk, 0, 1) * 100) / 100];
@@ -177,6 +177,21 @@ module.exports = function createSurf(ctx) {
       }
     }
   }, 'rooms'), 1000 / SEND_HZ);
+  // the owner watching someone: the waves they're on (a beach, or surfing alone) and everyone in the water with them
+  setInterval(safe(() => {
+    const now = Date.now();
+    for (const w of players) {
+      if (!w.watcher) continue;
+      const t = w.watchTarget;
+      if (!t || !players.has(t)) { send(w, { t: 'wst', gone: 1 }); continue; }
+      const r = t.room;
+      const sess = r ? { spot: r.spot, size: r.size, custom: r.custom, tod: r.tod, seed: r.seed } : t.sess;
+      if (!sess || !t.st || now - (t.stAt || 0) > 5000) { send(w, { t: 'wst', sess: null }); continue; }
+      const with_ = r ? [...r.players].filter(q => q.st && q !== t) : [];
+      const n = {}; for (const q of [t, ...with_]) n[q.cid] = [q.name, q.look];
+      send(w, { t: 'wst', sess, tt: r ? (now - r.start) / 1000 : t.tt + (now - t.stAt) / 1000, id: t.cid, p: [t.st, ...with_.map(q => q.st)], n });
+    }
+  }, 'watch'), 1000 / SEND_HZ);
   function cleanChat(x) {
     x = String(x || '').replace(/[\u0000-\u001f\u007f-\u009f​-‏‪-‮]/g, '').trim().slice(0, 120);
     return x.replace(BAD, w => '*'.repeat(w.length));
@@ -189,6 +204,14 @@ module.exports = function createSurf(ctx) {
     const prof = await loadProfile(who);
     if (p.ws.readyState !== 1) return;
     if (prof.banned) { send(p, { t: 'err', code: 'banned' }); setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 400); return; }
+    if (typeof msg.watch === 'string' && msg.watch) {           // the owner watching someone, unseen (checked against the verified sign-in)
+      if (!ctx.isOwnerWho || !ctx.isOwnerWho(who)) { send(p, { t: 'err', code: 'auth' }); setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 300); return; }
+      const lower = msg.watch.toLowerCase().slice(0, 20);
+      let t = null; for (const q of byUid.values()) if (q.name.toLowerCase() === lower && !q.watcher) t = q;
+      p.uid = who.uid; p.name = prof.name; p.authed = true; p.watcher = true; p.watchTarget = t;
+      send(p, { t: 'welcome', game: 'swellsurf', id: p.cid, name: p.name, best: {}, now: Date.now(), proto: SURF_PROTO, watch: t ? t.cid : 0, wname: t ? t.name : '' });
+      return;
+    }
     const old = byUid.get(who.uid);
     if (old && old !== p) { send(old, { t: 'err', code: 'elsewhere' }); leaveRoom(old); try { old.ws.close(); } catch (_) {} }
     p.uid = who.uid; p.name = prof.name; p.authed = true; byUid.set(p.uid, p);
@@ -203,7 +226,13 @@ module.exports = function createSurf(ctx) {
     let msg; try { msg = JSON.parse(raw); } catch (_) { return; }
     if (!msg || typeof msg !== 'object') return;
     if (!p.authed) { if (msg.t === 'hello' && !p.helloSeen) { p.helloSeen = true; onHello(p, msg).catch(e => { console.error('[swellsurf] hello', e); try { p.ws.close(); } catch (_) {} }); } return; }
+    if (p.watcher) { if (msg.t === 'ping') send(p, { t: 'pong', c: num(msg.c, 0, 1e15), s: Date.now() }); return; }   // watchers only watch
     switch (msg.t) {
+      case 'sess': {                                        // surfing alone: which waves (only used for the owner's watching)
+        const spot = S.SPOTS.find(s => s.id === msg.spot) ? msg.spot : 'coral', size = S.SIZES.includes(msg.size) ? msg.size : 'normal';
+        p.sess = { spot, size, custom: size === 'custom' ? S.cleanCustom(msg.custom) : null, tod: TODS.includes(msg.tod) ? msg.tod : 'day', seed: (Number(msg.seed) >>> 0) };
+        break;
+      }
       case 'ping': send(p, { t: 'pong', c: num(msg.c, 0, 1e15), s: Date.now() }); break;
       case 's': onState(p, msg); break;
       case 'rooms': send(p, { t: 'rooms', list: [...rooms.values()].filter(r => !r.priv).slice(0, 40).map(r => ({ id: r.id, spot: r.spot, size: r.size, tod: r.tod, n: r.players.size, host: r.host ? r.host.name : '', contest: r.contest ? { waves: r.contest.waves, state: r.contest.state } : null })) }); break;
@@ -271,8 +300,8 @@ module.exports = function createSurf(ctx) {
       try { wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req)); }
       catch (e) { console.error('[swellsurf] upgrade', e.message); try { socket.destroy(); } catch (_) {} }
     },
-    status() { let inRooms = 0; for (const r of rooms.values()) inRooms += r.players.size; return { players: [...players].filter(p => p.authed).length, inRooms, beaches: rooms.size }; },
-    list() { return [...players].filter(p => p.authed).map(p => ({ name: p.name, room: p.room ? 'SwellSurf beach ' + p.room.code : p.solo ? 'SwellSurf championship' : 'SwellSurf', kills: 0, owner: false })); },
+    status() { let inRooms = 0; for (const r of rooms.values()) inRooms += r.players.size; return { players: [...players].filter(p => p.authed && !p.watcher).length, inRooms, beaches: rooms.size }; },
+    list() { return [...players].filter(p => p.authed && !p.watcher).map(p => ({ name: p.name, room: p.room ? 'SwellSurf beach ' + p.room.code : p.solo ? 'SwellSurf championship' : 'SwellSurf', kills: 0, owner: false })); },
     findByName(lower) { for (const p of byUid.values()) if (p.name.toLowerCase() === lower) return { uid: p.uid, name: p.name }; return null; },
     kick(uid, code) { const p = byUid.get(uid); if (!p) return false; send(p, { t: 'err', code: code || 'banned' }); leaveRoom(p); setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 300); return true; },
   };
