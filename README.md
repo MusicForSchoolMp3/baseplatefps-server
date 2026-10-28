@@ -1,4 +1,4 @@
-# Baseplate Arcade game server (Baseplate FPS + RockLeague + othercolourbike)
+# Baseplate Arcade game server (Baseplate FPS + RockLeague + othercolourbike + SwellSurf)
 
 Runs every match: the big public match and private matches with codes. Each round is free for all,
 team deathmatch or last man standing; players vote on the next map and mode between rounds. It checks
@@ -39,3 +39,10 @@ in the website's othercolourbike folder. The bike park (public, or private with 
 sent as the controls pressed on every physics step; the server rides the run again itself and only saves the time and score
 it gets, so times can't be faked. Progress is saved to users/<uid>/ocb/progress and leaderboards to ocb/boards (players can't
 write either). Bans kick people out of othercolourbike too.
+
+SwellSurf (the surfing game) also runs on this server, on the `/surf` path, in `swellsurf.js`, with its own connections,
+so it can't affect the other games. `surf-physics.js` holds the waves and the surfing physics and MUST match the copy in the
+website's swellsurf folder. Beaches (up to 6 surfers on the same waves, open or private with a code) and surf contests are run
+here. Every scored wave is sent as where the surfer was just before it plus the controls pressed on every physics step; the
+server surfs the wave again itself and only saves or counts the score it gets, so scores can't be faked. Best waves are saved
+to users/<uid>/surf/best and leaderboards to surf/boards (players can't write either). Bans kick people out of SwellSurf too.

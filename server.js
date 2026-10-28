@@ -627,6 +627,7 @@ async function findAccount(name) {                               // an account b
   for (const p of byUid.values()) if (p.name.toLowerCase() === lower) return { uid: p.uid, name: p.name };
   const inRL = rlCall(x => x.findByName(lower), null); if (inRL) return inRL;
   const inOCB = ocbCall(x => x.findByName(lower), null); if (inOCB) return inOCB;
+  const inSurf = surfCall(x => x.findByName(lower), null); if (inSurf) return inSurf;
   if (knownNames.has(lower)) return { uid: knownNames.get(lower), name };
   if (db && admin) {
     try { const u = await admin.auth().getUserByEmail(lower + '@' + EMAIL_DOMAIN); return { uid: u.uid, name: u.displayName || name }; }
@@ -646,6 +647,7 @@ async function onAdmin(req, res) {
     for (const p of byUid.values()) if (p.room) list.push({ name: p.name, room: p.room.isPublic ? 'Public' : p.room.code, kills: p.kills, owner: COS.isOwner(p.name) });
     for (const r of rlCall(x => x.list(), [])) list.push(Object.assign(r, { owner: COS.isOwner(r.name) }));
     for (const r of ocbCall(x => x.list(), [])) list.push(Object.assign(r, { owner: COS.isOwner(r.name) }));
+    for (const r of surfCall(x => x.list(), [])) list.push(Object.assign(r, { owner: COS.isOwner(r.name) }));
     return adminSend(res, 200, { players: list.sort((a, b) => a.name.localeCompare(b.name)) });
   }
   if (req.method !== 'POST' || !['/admin/ban', '/admin/unban'].includes(req.url)) return adminSend(res, 404, { error: 'Unknown request.' });
@@ -662,7 +664,8 @@ async function onAdmin(req, res) {
     if (p) { send(p, { t: 'err', code: 'banned' }); if (p.room) leaveRoom(p, 'banned'); setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 300); }
     const kickedRL = !!rlCall(x => x.kick(acct.uid, 'banned'), false);                                     // kicked out of RockLeague too
     const kickedOCB = !!ocbCall(x => x.kick(acct.uid, 'banned'), false);                                   // and othercolourbike
-    const online = !!p || kickedRL || kickedOCB;
+    const kickedSurf = !!surfCall(x => x.kick(acct.uid, 'banned'), false);                                 // and SwellSurf
+    const online = !!p || kickedRL || kickedOCB || kickedSurf;
     console.log(`${me.name} banned ${acct.name}${online ? ' (kicked from the match)' : ''}`);
     return adminSend(res, 200, { ok: true, name: acct.name, online, msg: online ? `${acct.name} is banned and was kicked.` : `${acct.name} is banned.` });
   }
@@ -685,6 +688,12 @@ try {
   OCB = require('./othercolourbike.js')({ admin, getDb: () => db, verifyToken, modRec, knownNames, USER_RE, EMAIL_DOMAIN, DEV_TOKENS });
   console.log('othercolourbike is running on /ocb');
 } catch (e) { console.error('othercolourbike failed to start (the other games are unaffected):', e && e.message); }
+let SURF = null;                                                  // SwellSurf: same idea again, its own file, can't break the others
+try {
+  SURF = require('./swellsurf.js')({ admin, getDb: () => db, verifyToken, modRec, knownNames, USER_RE, EMAIL_DOMAIN, DEV_TOKENS });
+  console.log('SwellSurf is running on /surf');
+} catch (e) { console.error('SwellSurf failed to start (the other games are unaffected):', e && e.message); }
+const surfCall = (fn, dflt) => { try { return SURF ? fn(SURF) : dflt; } catch (e) { console.error('[swellsurf]', e && e.message); return dflt; } };
 const ocbCall = (fn, dflt) => { try { return OCB ? fn(OCB) : dflt; } catch (e) { console.error('[othercolourbike]', e && e.message); return dflt; } };
 const rlCall = (fn, dflt) => { try { return RL ? fn(RL) : dflt; } catch (e) { console.error('[rockleague]', e && e.message); return dflt; } };
 
@@ -694,7 +703,7 @@ const server = http.createServer((req, res) => {
     let n = 0; for (const r of rooms.values()) n += r.players.size;
     const pub = rooms.get('PUBLIC');
     res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*', 'cache-control': 'no-store' });
-    res.end(JSON.stringify({ players: n, public: { players: pub.players.size, mode: pub.mode, map: pub.map, phase: pub.phase }, rockleague: rlCall(r => r.status(), null), othercolourbike: ocbCall(r => r.status(), null) }));
+    res.end(JSON.stringify({ players: n, public: { players: pub.players.size, mode: pub.mode, map: pub.map, phase: pub.phase }, rockleague: rlCall(r => r.status(), null), othercolourbike: ocbCall(r => r.status(), null), swellsurf: surfCall(r => r.status(), null) }));
     return;
   }
   if (req.url.startsWith('/admin/')) {
@@ -718,6 +727,7 @@ server.on('upgrade', (req, socket, head) => {
   const path = String(req.url || '/').split('?')[0];
   if (path === '/rl') { if (RL) RL.handleUpgrade(req, socket, head); else socket.destroy(); return; }   // RockLeague
   if (path === '/ocb') { if (OCB) OCB.handleUpgrade(req, socket, head); else socket.destroy(); return; } // othercolourbike
+  if (path === '/surf') { if (SURF) SURF.handleUpgrade(req, socket, head); else socket.destroy(); return; } // SwellSurf
   wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));                         // Baseplate FPS (every other path, as before)
 });
 

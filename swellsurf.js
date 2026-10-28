@@ -184,7 +184,7 @@ module.exports = function createSurf(ctx) {
 
   /* ---------- messages ---------- */
   async function onHello(p, msg) {
-    if (msg.v !== SURF_PROTO || msg.phys !== S.VERSION) { send(p, { t: 'err', code: 'version' }); setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 300); return; }
+    if (msg.v !== SURF_PROTO || msg.phys !== S.VERSION) { send(p, { t: 'err', code: 'version', game: 'swellsurf' }); setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 300); return; }
     let who; try { who = await verifyToken(msg.token); } catch (_) { send(p, { t: 'err', code: 'auth' }); setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 300); return; }
     const prof = await loadProfile(who);
     if (p.ws.readyState !== 1) return;
@@ -194,7 +194,7 @@ module.exports = function createSurf(ctx) {
     p.uid = who.uid; p.name = prof.name; p.authed = true; byUid.set(p.uid, p);
     if (knownNames) knownNames.set(prof.name.toLowerCase(), p.uid);
     p.look = cleanLook(msg.look);
-    send(p, { t: 'welcome', id: p.cid, name: p.name, best: prof.best, now: Date.now(), proto: SURF_PROTO });
+    send(p, { t: 'welcome', game: 'swellsurf', id: p.cid, name: p.name, best: prof.best, now: Date.now(), proto: SURF_PROTO });
   }
   function onMessage(p, raw) {
     const now = Date.now();

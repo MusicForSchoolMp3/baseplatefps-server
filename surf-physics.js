@@ -8,7 +8,7 @@
   if (typeof module === 'object' && module.exports) module.exports = api; else root.SURF = api;
 })(typeof self !== 'undefined' ? self : this, function () {
 'use strict';
-const VERSION = 1;
+const VERSION = 2;
 const DT = 1 / 60, G = 9.81;
 const PI = 3.141592653589793, TAU = 6.283185307179586;
 
@@ -48,21 +48,21 @@ function hash(a, b, c) {
 // dir: the way the wave peels along the beach (+1 toward +x, -1 toward -x, 0 = A-frame, either way).
 // Facing the beach (+z), +x is on your left: so dir +1 is a left-hander and dir -1 a right-hander.
 const SPOTS = [
-  { id: 'coral', coast: 'point', name: 'Coral Point', kind: 'Long left point', blurb: 'A long, perfect left peeling down a palm-lined point. The classic.', dir: 1, H: 1.55, c: 4.1, vp: 7.0, hollow: 0.55, len: 290, vari: 0.22, gap: 46, n: 4, per: 11, jit: 5, best: 'Shortboard',
+  { id: 'coral', coast: 'point', name: 'Coral Point', kind: 'Long left point', blurb: 'A long, perfect left peeling down a palm-lined point. The classic.', dir: 1, H: 2.5, c: 5.0, vp: 7.6, hollow: 0.75, len: 290, vari: 0.22, gap: 34, n: 4, per: 9, jit: 5, best: 'Shortboard',
     look: { water: '#16b3c4', deep: '#0b4f86', sand: '#f3e2b6', land: '#3f9a4a', hill: 1.0, palms: 1.0, rock: 0.2, isl: 0 } },
-  { id: 'pit', coast: 'reef', name: 'The Pit', kind: 'Heavy right reef', blurb: 'A short, heavy right on a shallow reef that throws a big round barrel.', dir: -1, H: 1.75, c: 4.4, vp: 8.6, hollow: 1.0, len: 170, vari: 0.32, gap: 42, n: 4, per: 11, jit: 3, best: 'Shortboard',
+  { id: 'pit', coast: 'reef', name: 'The Pit', kind: 'Heavy right reef', blurb: 'A short, heavy right on a shallow reef that throws a big round barrel.', dir: -1, H: 2.8, c: 5.4, vp: 9.0, hollow: 1.2, len: 170, vari: 0.32, gap: 32, n: 4, per: 9, jit: 3, best: 'Shortboard',
     look: { water: '#12a9bd', deep: '#0a467c', sand: '#eedcae', land: '#4c8f3f', hill: 1.4, palms: 0.6, rock: 0.7, isl: 1 } },
-  { id: 'lagoon', coast: 'reef', name: 'Lazy Lagoon', kind: 'Soft right', blurb: 'Soft, rolling rights in a turquoise lagoon. Perfect for longboards and learning.', dir: -1, H: 1.05, c: 3.5, vp: 5.0, hollow: 0.15, len: 300, vari: 0.14, gap: 40, n: 5, per: 10, jit: 6, best: 'Longboard',
+  { id: 'lagoon', coast: 'reef', name: 'Lazy Lagoon', kind: 'Soft right', blurb: 'Soft, rolling rights in a turquoise lagoon. Perfect for longboards and learning.', dir: -1, H: 1.7, c: 4.3, vp: 5.8, hollow: 0.35, len: 300, vari: 0.14, gap: 30, n: 5, per: 8, jit: 6, best: 'Longboard',
     look: { water: '#2cc6c9', deep: '#0f6a96', sand: '#f7ead0', land: '#46a456', hill: 0.6, palms: 1.4, rock: 0.0, isl: 2 } },
-  { id: 'peak', coast: 'beach', name: 'Palm Peak', kind: 'A-frame peak', blurb: 'An A-frame peak in front of the palms: some waves go left, some go right.', dir: 0, H: 1.5, c: 4.0, vp: 7.2, hollow: 0.6, len: 200, vari: 0.28, gap: 44, n: 4, per: 11, jit: 8, best: 'Twin fin',
+  { id: 'peak', coast: 'beach', name: 'Palm Peak', kind: 'A-frame peak', blurb: 'An A-frame peak in front of the palms: some waves go left, some go right.', dir: 0, H: 2.4, c: 5.0, vp: 7.8, hollow: 0.85, len: 200, vari: 0.28, gap: 33, n: 4, per: 9, jit: 8, best: 'Twin fin',
     look: { water: '#18b6c2', deep: '#0b5187', sand: '#f5e4ba', land: '#3b9445', hill: 0.8, palms: 1.6, rock: 0.1, isl: 3 } },
-  { id: 'bommie', coast: 'reef', name: 'The Bommie', kind: 'Big wave outer reef', blurb: 'An outer reef that only wakes up for big swell. Take the gun, or tow in with the jet ski (T).', dir: 1, H: 3.7, c: 5.6, vp: 9.8, hollow: 0.55, len: 240, vari: 0.24, gap: 56, n: 3, per: 14, jit: 6, best: 'Gun',
+  { id: 'bommie', coast: 'reef', name: 'The Bommie', kind: 'Big wave outer reef', blurb: 'An outer reef that only wakes up for big swell. Take the gun, or tow in with the jet ski (T).', dir: 1, H: 5.6, c: 7.2, vp: 11.0, hollow: 0.75, len: 240, vari: 0.24, gap: 42, n: 3, per: 11, jit: 6, best: 'Gun',
     look: { water: '#139fbb', deep: '#08396d', sand: '#e9d6a6', land: '#3b7f3c', hill: 1.8, palms: 0.5, rock: 1.0, isl: 4 } },
-  { id: 'spit', coast: 'beach', name: 'Sand Spit', kind: 'Punchy beach break', blurb: 'A punchy beach break with shifting peaks, quick rides and lots of sections.', dir: 0, H: 1.4, c: 4.2, vp: 8.2, hollow: 0.75, len: 130, vari: 0.48, gap: 38, n: 5, per: 9, jit: 22, best: 'Fish',
+  { id: 'spit', coast: 'beach', name: 'Sand Spit', kind: 'Punchy beach break', blurb: 'A punchy beach break with shifting peaks, quick rides and lots of sections.', dir: 0, H: 2.2, c: 5.0, vp: 8.6, hollow: 0.95, len: 130, vari: 0.48, gap: 30, n: 5, per: 8, jit: 22, best: 'Fish',
     look: { water: '#27b9b9', deep: '#0d5a83', sand: '#f2deae', land: '#5b9b4a', hill: 0.4, palms: 0.8, rock: 0.0, isl: 5 } },
-  { id: 'rocky', coast: 'point', name: 'Rocky Rights', kind: 'Fast right point', blurb: 'A fast right point with racy sections. Pump hard to make them.', dir: -1, H: 1.6, c: 4.3, vp: 8.4, hollow: 0.6, len: 260, vari: 0.52, gap: 46, n: 4, per: 11, jit: 5, best: 'Twin fin',
+  { id: 'rocky', coast: 'point', name: 'Rocky Rights', kind: 'Fast right point', blurb: 'A fast right point with racy sections. Pump hard to make them.', dir: -1, H: 2.5, c: 5.1, vp: 8.8, hollow: 0.8, len: 260, vari: 0.52, gap: 34, n: 4, per: 9, jit: 5, best: 'Twin fin',
     look: { water: '#14a6bf', deep: '#0a4275', sand: '#dccba0', land: '#4a7d3b', hill: 1.6, palms: 0.4, rock: 1.2, isl: 6 } },
-  { id: 'slab', coast: 'reef', name: 'Sunset Slab', kind: 'Hollow slab', blurb: 'A shallow slab: steep drops and the hollowest barrels on the island.', dir: 1, H: 1.9, c: 4.6, vp: 10.5, hollow: 1.25, len: 120, vari: 0.3, gap: 44, n: 4, per: 12, jit: 3, best: 'Bodyboard',
+  { id: 'slab', coast: 'reef', name: 'Sunset Slab', kind: 'Hollow slab', blurb: 'A shallow slab: steep drops and the hollowest barrels on the island.', dir: 1, H: 3.0, c: 5.8, vp: 11.0, hollow: 1.45, len: 120, vari: 0.3, gap: 33, n: 4, per: 9, jit: 3, best: 'Bodyboard',
     look: { water: '#10a2b8', deep: '#083d71', sand: '#e6d1a0', land: '#43863e', hill: 1.2, palms: 0.7, rock: 0.9, isl: 7 } },
 ];
 for (const sp of SPOTS) sp.zShore = Math.round(sp.c * (sp.len / sp.vp * 1.25 + 12) + 45);
@@ -78,21 +78,21 @@ function coastZ(sp, x) {
 const SIZES = ['normal', 'extreme', 'custom'];
 // custom wave settings (free surf only): h = wave height in metres, hol = hollowness, peel = peel speed (x the spot's),
 // n = waves in a set, gap = seconds between sets, dir = 2 for the spot's way, or -1 / 0 / 1
-const CUSTOM_DEFAULT = { h: 1.8, hol: 0.7, peel: 1, n: 4, gap: 44, dir: 2 };
+const CUSTOM_DEFAULT = { h: 2.6, hol: 0.85, peel: 1, n: 4, gap: 34, dir: 2 };
 function cleanCustom(c) {
   c = c && typeof c === 'object' ? c : {};
   const n = (v, lo, hi, d) => typeof v === 'number' && isFinite(v) ? clamp(v, lo, hi) : d;
-  const out = { h: Math.round(n(c.h, 0.6, 7, 1.8) * 10) / 10, hol: Math.round(n(c.hol, 0, 1.5, 0.7) * 100) / 100, peel: Math.round(n(c.peel, 0.6, 1.6, 1) * 100) / 100,
-    n: Math.round(n(c.n, 1, 7, 4)), gap: Math.round(n(c.gap, 25, 90, 44)), dir: [2, -1, 0, 1].includes(c.dir) ? c.dir : 2 };
-  if (out.gap < out.n * 9 + 8) out.gap = out.n * 9 + 8;
+  const out = { h: Math.round(n(c.h, 0.8, 9, 2.6) * 10) / 10, hol: Math.round(n(c.hol, 0, 1.6, 0.85) * 100) / 100, peel: Math.round(n(c.peel, 0.6, 1.6, 1) * 100) / 100,
+    n: Math.round(n(c.n, 1, 7, 4)), gap: Math.round(n(c.gap, 20, 90, 34)), dir: [2, -1, 0, 1].includes(c.dir) ? c.dir : 2 };
+  if (out.gap < out.n * 8 + 6) out.gap = out.n * 8 + 6;
   return out;
 }
 function waveConfig(sp, size, custom) {
   const k = { H: sp.H, c: sp.c, vp: sp.vp, hollow: sp.hollow, len: sp.len, vari: sp.vari, gap: sp.gap, n: sp.n, per: sp.per, jit: sp.jit, dir: sp.dir };
-  if (size === 'extreme') { k.H *= 1.7; k.hollow *= 1.15; k.vp *= 1.1; k.c *= 1.15; k.per *= 1.12; k.gap = Math.max(k.gap, k.n * k.per + 12); }
+  if (size === 'extreme') { k.H *= 1.6; k.hollow *= 1.1; k.vp *= 1.1; k.c *= 1.12; k.per *= 1.1; k.gap = Math.max(k.gap, k.n * k.per + 10); }
   else if (size === 'custom') {
     const c = cleanCustom(custom);
-    k.c *= clamp(Math.sqrt(c.h / sp.H), 0.7, 1.6); k.H = c.h; k.hollow = c.hol; k.vp *= c.peel; k.n = c.n; k.gap = c.gap; k.per = Math.min(k.per, (c.gap - 8) / c.n);
+    k.c *= clamp(Math.sqrt(c.h / sp.H), 0.7, 1.6); k.H = c.h; k.hollow = c.hol; k.vp *= c.peel; k.n = c.n; k.gap = c.gap; k.per = Math.min(k.per, (c.gap - 6) / c.n);
     if (c.dir !== 2) k.dir = c.dir;
   }
   return k;
@@ -100,7 +100,7 @@ function waveConfig(sp, size, custom) {
 
 /* ---------------- wave schedule ---------------- */
 // Waves come in sets. Everything about every wave comes from the seed, so every player in a beach sees exactly the same waves.
-const SEG = 25, FIRST = 14;
+const SEG = 25, FIRST = 8;
 function makeSchedule(seed, spotId, size, custom) {
   const sp = SPOTS.find(s => s.id === spotId) || SPOTS[0];
   if (!SIZES.includes(size)) size = 'normal';
@@ -133,8 +133,8 @@ function setOf(sch, j) {
 function wavesAt(sch, t) {
   if (sch.actT === t) return sch.act;
   const k = sch.cfg, out = [];
-  const j0 = Math.floor((t - FIRST - 140) / k.gap) - 1, j1 = Math.floor((t - FIRST + 40) / k.gap) + 1;
-  for (let j = Math.max(0, j0); j <= j1; j++) for (const w of setOf(sch, j)) { const tau = t - w.tB; if (tau > -36 && tau < w.tEnd + 18) out.push(w); }
+  const j0 = Math.floor((t - FIRST - 140) / k.gap) - 1, j1 = Math.floor((t - FIRST + 28) / k.gap) + 1;
+  for (let j = Math.max(0, j0); j <= j1; j++) for (const w of setOf(sch, j)) { const tau = t - w.tB; if (tau > -24 && tau < w.tEnd + 18) out.push(w); }
   sch.act = out; sch.actT = t;
   return out;
 }
@@ -166,15 +166,15 @@ const WB = 3.2, FRONT = 1.9;
 // one wave's height at (x, z, t). q (optional) gets the details.
 function waveCore(w, x, z, t, q) {
   const tau = t - w.tB;
-  if (tau < -36 || tau > w.tEnd + 18) { if (q) q.on = false; return 0; }
-  const At = sstep((tau + 36) / 12) * (1 - sstep((tau - w.tEnd - 6) / 10));
+  if (tau < -24 || tau > w.tEnd + 18) { if (q) q.on = false; return 0; }
+  const At = sstep((tau + 24) / 7) * (1 - sstep((tau - w.tEnd - 6) / 10));
   const s = w.dir * (x - w.xPk), u = z - w.c * tau, H = w.H, wb = WB * H;
   if (!q && (u < -wb || u > 5.4 * H)) return 0;
   let As = 1;
   if (s < 0) { const k = s / 26, k2 = k * k; As = 1 / (1 + k2 * k2); }
   else if (s > w.len + 30) { const k = (s - w.len - 30) / 30, k2 = k * k; As = 1 / (1 + k2 * k2); }
   const d = (peelT(w, s) - tau) * w.vp;
-  const Dt = w.hollow * (1.1 + 0.85 * H) + 0.4;
+  const Dt = w.hollow * (1.4 + 1.1 * H) + 0.6;
   const b = d >= -0.55 * Dt ? 0 : sstep((-d - 0.55 * Dt) / (1.3 * Dt));
   const wf0 = H * (1.15 - 0.25 * (w.hollow < 1.2 ? w.hollow : 1.2));
   let wf, Hf;
@@ -224,15 +224,15 @@ function sample(sch, x, z, t, wid, o) {
 /* ---------------- boards ---------------- */
 // fam: surf = stand-up boards, body = bodyboard (prone), bodysurf = no board
 const BOARDS = [
-  { id: 'short', name: 'Shortboard', fam: 'surf', len: 1.83, wid: 0.49, th: 0.062, nose: 0.12, tail: 'squash', fins: 3, rocker: 0.11, turn: 3.2, grip: 6.5, vane: 6, kl: 0.03, kq: 0.0105, pump: 2.7, vmax: 13, paddle: 1.0, catch: 1.0, air: 1.0, spin: 7.6, flip: 6.6, roll: 0, tip: 'Does everything: snaps, airs, barrels.' },
-  { id: 'twin', name: 'Twin fin', fam: 'surf', len: 1.66, wid: 0.53, th: 0.064, nose: 0.2, tail: 'swallow', fins: 2, rocker: 0.09, turn: 3.6, grip: 4.7, vane: 4.4, kl: 0.028, kq: 0.0098, pump: 3.0, vmax: 13.6, paddle: 1.05, catch: 1.06, air: 1.05, spin: 8.2, flip: 6.8, roll: 0, tip: 'Looser: tail slides and reverses come easy.' },
-  { id: 'fish', name: 'Fish', fam: 'surf', len: 1.6, wid: 0.55, th: 0.066, nose: 0.3, tail: 'swallow', fins: 2, rocker: 0.07, turn: 2.95, grip: 5.6, vane: 5.2, kl: 0.026, kq: 0.0094, pump: 3.3, vmax: 13.8, paddle: 1.12, catch: 1.15, air: 0.9, spin: 7.2, flip: 6.2, roll: 0, tip: 'Fast and flowy. Best in small waves.' },
-  { id: 'gun', name: 'Gun', fam: 'surf', len: 2.36, wid: 0.48, th: 0.075, nose: 0.05, tail: 'pin', fins: 3, rocker: 0.13, turn: 2.1, grip: 8.2, vane: 8, kl: 0.026, kq: 0.0082, pump: 1.9, vmax: 16.5, paddle: 1.35, catch: 1.36, air: 0.6, spin: 5.6, flip: 5.2, roll: 0, tip: 'Long and stable for big waves and late drops.' },
-  { id: 'long', name: 'Longboard', fam: 'surf', len: 2.85, wid: 0.57, th: 0.075, nose: 0.55, tail: 'square', fins: 1, rocker: 0.07, turn: 1.75, grip: 7, vane: 7, kl: 0.03, kq: 0.0105, pump: 1.4, vmax: 11.8, paddle: 1.45, catch: 1.5, air: 0.35, spin: 4.5, flip: 4, roll: 0, walk: true, tip: 'Hold Space to walk to the nose. Hang five, hang ten.' },
-  { id: 'single', name: 'Single fin', fam: 'surf', len: 2.1, wid: 0.53, th: 0.068, nose: 0.14, tail: 'pin', fins: 1, rocker: 0.09, turn: 2.25, grip: 7.2, vane: 7.6, kl: 0.028, kq: 0.0096, pump: 1.8, vmax: 13.2, paddle: 1.2, catch: 1.2, air: 0.6, spin: 5.8, flip: 5.4, roll: 0, single: true, tip: 'Smooth lines and long trims. Turn too hard and it spins out.' },
-  { id: 'alaia', name: 'Alaia', fam: 'surf', len: 1.92, wid: 0.46, th: 0.024, nose: 0.4, tail: 'square', fins: 0, rocker: 0.02, turn: 3.0, grip: 2.3, vane: 1.6, kl: 0.024, kq: 0.0092, pump: 2.0, vmax: 13.5, paddle: 0.8, catch: 0.86, air: 0.7, spin: 7, flip: 5.6, roll: 0, finless: true, tip: 'A finless wooden plank. It slides everywhere. Hard to catch waves.' },
-  { id: 'body', name: 'Bodyboard', fam: 'body', len: 1.05, wid: 0.55, th: 0.06, nose: 1, tail: 'crescent', fins: 0, rocker: 0.04, turn: 3.6, grip: 4.6, vane: 3.2, kl: 0.03, kq: 0.0105, pump: 2.5, vmax: 12.4, paddle: 1.12, catch: 1.2, air: 1.12, spin: 8.4, flip: 7, roll: 7.2, prone: true, tip: 'Lie on it. X to drop knee. Up in the air rolls (El rollo).' },
-  { id: 'bodysurf', name: 'Bodysurf', fam: 'bodysurf', len: 0, wid: 0, th: 0, nose: 0, tail: '', fins: 0, rocker: 0, turn: 2.6, grip: 3.6, vane: 2.4, kl: 0.05, kq: 0.016, pump: 1.3, vmax: 8.6, paddle: 0.85, catch: 1.04, air: 0.3, spin: 6, flip: 5, roll: 0, prone: true, tip: 'No board. G puts the handplane on for more speed. Best in soft waves.' },
+  { id: 'short', name: 'Shortboard', fam: 'surf', len: 1.83, wid: 0.49, th: 0.062, nose: 0.12, tail: 'squash', fins: 3, rocker: 0.11, turn: 3.68, grip: 6.5, vane: 6, kl: 0.0135, kq: 0.00547, pump: 3.645, vmax: 17.0, paddle: 1.15, catch: 1.0, air: 1.0, spin: 7.6, flip: 6.6, roll: 0, tip: 'Does everything: snaps, airs, barrels.' },
+  { id: 'twin', name: 'Twin fin', fam: 'surf', len: 1.66, wid: 0.53, th: 0.064, nose: 0.2, tail: 'swallow', fins: 2, rocker: 0.09, turn: 4.14, grip: 4.7, vane: 4.4, kl: 0.0126, kq: 0.00511, pump: 4.05, vmax: 17.6, paddle: 1.2075, catch: 1.06, air: 1.05, spin: 8.2, flip: 6.8, roll: 0, tip: 'Looser: tail slides and reverses come easy.' },
+  { id: 'fish', name: 'Fish', fam: 'surf', len: 1.6, wid: 0.55, th: 0.066, nose: 0.3, tail: 'swallow', fins: 2, rocker: 0.07, turn: 3.3925, grip: 5.6, vane: 5.2, kl: 0.0117, kq: 0.0049, pump: 4.455, vmax: 17.8, paddle: 1.288, catch: 1.15, air: 0.9, spin: 7.2, flip: 6.2, roll: 0, tip: 'Fast and flowy. Best in small waves.' },
+  { id: 'gun', name: 'Gun', fam: 'surf', len: 2.36, wid: 0.48, th: 0.075, nose: 0.05, tail: 'pin', fins: 3, rocker: 0.13, turn: 2.415, grip: 8.2, vane: 8, kl: 0.0117, kq: 0.00425, pump: 2.565, vmax: 20.5, paddle: 1.5525, catch: 1.36, air: 0.6, spin: 5.6, flip: 5.2, roll: 0, tip: 'Long and stable for big waves and late drops.' },
+  { id: 'long', name: 'Longboard', fam: 'surf', len: 2.85, wid: 0.57, th: 0.075, nose: 0.55, tail: 'square', fins: 1, rocker: 0.07, turn: 2.0125, grip: 7, vane: 7, kl: 0.0135, kq: 0.00547, pump: 1.89, vmax: 15.8, paddle: 1.6675, catch: 1.5, air: 0.35, spin: 4.5, flip: 4, roll: 0, walk: true, tip: 'Hold Space to walk to the nose. Hang five, hang ten.' },
+  { id: 'single', name: 'Single fin', fam: 'surf', len: 2.1, wid: 0.53, th: 0.068, nose: 0.14, tail: 'pin', fins: 1, rocker: 0.09, turn: 2.5875, grip: 7.2, vane: 7.6, kl: 0.0126, kq: 0.00497, pump: 2.43, vmax: 17.2, paddle: 1.38, catch: 1.2, air: 0.6, spin: 5.8, flip: 5.4, roll: 0, single: true, tip: 'Smooth lines and long trims. Turn too hard and it spins out.' },
+  { id: 'alaia', name: 'Alaia', fam: 'surf', len: 1.92, wid: 0.46, th: 0.024, nose: 0.4, tail: 'square', fins: 0, rocker: 0.02, turn: 3.45, grip: 2.3, vane: 1.6, kl: 0.0108, kq: 0.00475, pump: 2.7, vmax: 17.5, paddle: 0.92, catch: 0.86, air: 0.7, spin: 7, flip: 5.6, roll: 0, finless: true, tip: 'A finless wooden plank. It slides everywhere. Hard to catch waves.' },
+  { id: 'body', name: 'Bodyboard', fam: 'body', len: 1.05, wid: 0.55, th: 0.06, nose: 1, tail: 'crescent', fins: 0, rocker: 0.04, turn: 4.14, grip: 4.6, vane: 3.2, kl: 0.0135, kq: 0.00547, pump: 3.375, vmax: 14.9, paddle: 1.288, catch: 1.2, air: 1.12, spin: 8.4, flip: 7, roll: 7.2, prone: true, tip: 'Lie on it. X to drop knee. Up in the air rolls (El rollo).' },
+  { id: 'bodysurf', name: 'Bodysurf', fam: 'bodysurf', len: 0, wid: 0, th: 0, nose: 0, tail: '', fins: 0, rocker: 0, turn: 2.99, grip: 3.6, vane: 2.4, kl: 0.0225, kq: 0.00828, pump: 1.755, vmax: 11.1, paddle: 0.9775, catch: 1.04, air: 0.3, spin: 6, flip: 5, roll: 0, prone: true, tip: 'No board. G puts the handplane on for more speed. Best in soft waves.' },
 ];
 const BOARD_IDS = BOARDS.map(b => b.id);
 
@@ -252,7 +252,7 @@ function newSurfer(board, stance) {
   const b = Math.max(0, BOARD_IDS.indexOf(board));
   return {
     v: VERSION, t: 0, mode: PADDLE, b, st: stance ? 1 : 0, x: 0, y: 0, z: -6, vx: 0, vy: 0, vz: 0, yaw: PI, pitch: 0, roll: 0, pin: 0,
-    sph: 0, arm: 0, dk: 0, dcd: 0, wash: 0, ct0: 0, pop: 0, wid: -1, ff: 0, pph: 0, wk: 0, dkn: 0, hp: 0, sw: 0, idle: 0,
+    sph: 0, arm: 0, ti: 0, dk: 0, dcd: 0, wash: 0, ct0: 0, pop: 0, wid: -1, ff: 0, pph: 0, wk: 0, dkn: 0, hp: 0, sw: 0, idle: 0,
     tdir: 0, tang: 0, tT: 0, ta0: 0, tb0: 0, tp0: 0, td0: 0, tsh: 0, tsl: 0, tx: 0, cbT: -9,
     rel: 0, relM: 0, ft: 0, tt: 0, tdp: 0, ww: 0, slow: 0, rt: 0, nt: 0, hh: 0, hf: 0, ht: 0, sa: 0, trim: 0, slT: 0, adT: 0, dkT: 0, cuT: 0, ldp: 0,
     at: 0, as: 0, af: 0, ar: 0, ag: 0, ah: 0, ay0: 0, apm: 0, asd: 0, rev: 0,
@@ -350,7 +350,7 @@ function resetRide(s) {
 }
 function startRide(s, q, slope) {
   resetRide(s);
-  s.mode = RIDE; s.pop = BOARDS[s.b].prone ? 0.22 : 0.45; s.wid = q.id; s.ct0 = 0; s.sph = 0;
+  s.mode = RIDE; s.pop = BOARDS[s.b].prone ? 0.18 : 0.32; s.wid = q.id; s.ti = 0; s.ct0 = 0; s.sph = 0;
   s.ldp = (q.d < 4 || slope > 1.25) && q.H > 1.2 ? 1 : 0;
   s.ev.push({ k: 'catch', late: s.ldp });
 }
@@ -398,7 +398,8 @@ function rideStep(s, sch, inp, t) {
   if (!q || q.At < 0.2) return endOk(s, 'The wave faded out');
   s.rt += DT;
   const Lk = inp & K.L, Rk = inp & K.R, Up = inp & K.U, Dn = inp & K.D, SP = inp & K.SP, SH = inp & K.SH, Xk = inp & K.X, Hk = inp & K.H;
-  let turn = (Lk ? 1 : 0) - (Rk ? 1 : 0);
+  const turn = (Lk ? 1 : 0) - (Rk ? 1 : 0);
+  s.ti += clamp(turn - s.ti, -7 * DT, 7 * DT);            // steering eases in and out, so carves are smooth
   const popping = s.pop > 0, ctrl = popping ? 0.3 : 1;
   if (popping) s.pop = Math.max(0, s.pop - DT);
   // gravity down the face
@@ -423,7 +424,7 @@ function rideStep(s, sch, inp, t) {
   s.ff += clamp(ffT - s.ff, -6 * DT, 6 * DT);
   const hpk = fam === 'bodysurf' && s.hp ? 1.25 : 1;
   const gk = B.grip * (1 - 0.78 * s.ff) * (inWW ? 0.6 : 1);
-  const la2 = la * fexp(-gk * DT), eff = 0.92 - 0.6 * s.ff - (B.finless ? 0.25 : 0);
+  const la2 = la * fexp(-gk * DT), eff = 0.96 - 0.6 * s.ff - (B.finless ? 0.25 : 0);
   let al2 = sgn(al) * Math.sqrt(al * al + (la * la - la2 * la2) * eff);
   const stall = SH && !popping && fam !== 'bodysurf' ? 1 : (fam === 'bodysurf' && SH ? 1.2 : 0);
   const kq = B.kq / hpk + stall * 0.085 + (inWW ? 0.05 : 0) + s.ff * 0.03;
@@ -434,13 +435,15 @@ function rideStep(s, sch, inp, t) {
     s.pph += DT / 0.55; if (s.pph >= 1) s.pph -= 1;
     if (s.pph < 0.5) al2 += sgn(al2) * B.pump * hpk * Math.max(0, 1 - sp / (B.vmax * hpk)) * DT;
   } else s.pph = 0;
+  // the wave drives you along when you trim across the face
+  if (onFace && q.p > 0.2 && q.p < 0.92 && !stall && !popping) al2 += sgn(al2) * 1.7 * (slope < 1.5 ? slope : 1.5) * Math.max(0, 1 - sp / B.vmax) * (Math.abs(hx * q.dir) > 0.3 ? 1 : 0.35) * DT;
   if (Up && onFace && hz > 0.15 && fam === 'surf' && !B.walk) al2 += sgn(al2) * 0.6 * Math.max(0, 1 - sp / B.vmax) * DT;
   if (nose && onFace && q.p > 0.25 && q.p < 0.9) al2 += sgn(al2) * 0.85 * Math.max(0, 1 - sp / (B.vmax + 1)) * DT;
   rx = al2 * hx + la2 * hz; rz = al2 * hz - la2 * hx;
   s.vx = rx; s.vz = rz + fl;
   // steering, and the fins pulling the board back in line with where it's going
-  const rate = B.turn * hpk * clamp(0.4 + sp / 9, 0.4, 1.25) * ctrl * (s.ff > 0.5 ? 1.25 : 1) * (nose ? 0.3 : 1) * (s.dkn ? 0.88 : 1);
-  const yawD = turn * rate;
+  const rate = B.turn * hpk * clamp(0.45 + sp / 10, 0.45, 1.35) * ctrl * (s.ff > 0.5 ? 1.25 : 1) * (nose ? 0.3 : 1) * (s.dkn ? 0.88 : 1);
+  const yawD = s.ti * rate;
   const sinD = sp > 0.3 ? (rx * hz - rz * hx) / sp : 0, cosD = sp > 0.3 ? (rx * hx + rz * hz) / sp : 1;
   const vane = B.vane * (1 - 0.85 * s.ff) * (sp < 3 ? sp / 3 : 1) * sinD;
   const dyaw = (yawD + vane) * DT;
@@ -450,8 +453,13 @@ function rideStep(s, sch, inp, t) {
   s.x += s.vx * DT; s.z += s.vz * DT;
   const h2 = surfH(sch, s.x, s.z, t + DT);
   const yb = s.y + s.vy * DT - 0.5 * G * DT * DT;
-  if (!popping && yb > h2 + 0.05 && s.vy > 1.3) {
-    s.mode = AIR; s.y = yb; s.vy = Math.min(s.vy - G * DT, 3.6 + 2.6 * B.air) + (SP && fam !== 'bodysurf' ? 1.0 * B.air : 0);
+  // flick off the top: tap Space (or Up) while going up the face
+  const flick = !popping && (press(s, inp, K.SP) || press(s, inp, K.U)) && q.p > 0.5 && s.vy > 0.6 && sp > 4.5 && fam !== 'bodysurf' && !B.walk;
+  if (flick || (!popping && yb > h2 + 0.03 && s.vy > 1.0)) {
+    s.mode = AIR; s.y = flick ? s.y + 0.05 : yb;
+    s.vy = flick ? (s.vy > 0 ? s.vy * 0.35 : 0) + (2.4 + 0.26 * sp) * B.air : Math.min(s.vy - G * DT, 2.2 + 1.6 * B.air) + (SP && fam !== 'bodysurf' ? 0.8 * B.air : 0);
+    // the lip throws you forward with the wave, so you come down on the face, not off the back
+    if (s.vz < q.c * 1.12) s.vz = q.c * 1.12;
     endTurn(s, q, hx, hz); s.tdir = 0;
     s.at = 0; s.as = 0; s.af = 0; s.ar = 0; s.ag = 0; s.ah = 0; s.ay0 = s.y; s.apm = 0; s.asd = 0; s.rev = 0;
     s.ev.push({ k: 'air' });
@@ -550,7 +558,7 @@ function endTurn(s, q, hx, hz) {
 function airStep(s, sch, inp, t) {
   const B = BOARDS[s.b];
   const turn = (inp & K.L ? 1 : 0) - (inp & K.R ? 1 : 0);
-  s.vy -= G * DT;
+  s.vy -= G * 0.82 * DT;                                 // a little floaty, for style
   s.vx *= 1 - 0.03 * DT; s.vz *= 1 - 0.03 * DT;
   s.x += s.vx * DT; s.y += s.vy * DT; s.z += s.vz * DT;
   s.at += DT;
@@ -576,10 +584,10 @@ function airStep(s, sch, inp, t) {
   hx = fsin(s.yaw); hz = fcos(s.yaw);
   const cosD = (s.vx * hx + s.vz * hz) / hsp;
   const pe2 = Math.abs(wrapA(s.pitch)), re = Math.abs(wrapA(s.roll));
-  const fwd = cosD > 0.62, back = cosD < -0.62;
+  const fwd = cosD > 0.55, back = cosD < -0.55;
   s.y = h;
   if (!q) return endOk(s, 'The wave faded out');
-  if (pe2 > 0.8 || re > 0.85 || !(fwd || back)) return wipe(s, 'Bad landing');
+  if (pe2 > 0.9 || re > 0.95 || !(fwd || back)) return wipe(s, 'Bad landing');
   if (q.b > 0.6 && q.p > 0.1 && q.u > -0.3 * q.wf && q.u < 1.6 * q.wf && B.fam === 'surf' && !B.walk) return wipe(s, 'Landed in the whitewater');
   s.mode = RIDE; s.vy = 0; s.vx *= 0.87; s.vz *= 0.87;
   s.pitch = 0; s.roll = 0;
