@@ -250,7 +250,7 @@
       if (vn < 0) {
         addTo(b.v, n, -vn * (1 + (-vn > 0.5 ? BALL.rest : 0)));
         // friction at the contact point turns sliding into rolling and spin into a kick
-        const rc = mul(n, -BALL.r), slip = sub(sub(b.v, mul(n, dot(b.v, n))), cross(b.w, rc));
+        const rc = mul(n, -BALL.r), slip = add(sub(b.v, mul(n, dot(b.v, n))), cross(b.w, rc));   // how fast the contact point slides: v + w x r
         const sl = len(slip);
         if (sl > 1e-4) {
           const j = Math.min(sl * 2 / 7, BALL.mu * (1 + BALL.rest) * -vn + 0.02);
@@ -260,7 +260,16 @@
         }
         if (-vn > 3) events.push({ t: 'bounce', s: -vn });
       }
+      // touching the ground or a wall: spin about the contact point (like a top) dies away instead of going on forever,
+      // and a ball rolling on the floor slows down and comes to rest
+      const tw = dot(b.w, n); addTo(b.w, n, -tw * Math.min(1, 3 * dt));
+      if (n[1] > 0.6) {
+        const vt = sub(b.v, mul(n, dot(b.v, n))), st = len(vt);
+        if (st > 1e-6) addTo(b.v, vt, -Math.min(st, 0.6 * dt) / st);
+        if (st < 0.05 && len(b.w) < 0.4) { b.v = mul(n, dot(b.v, n)); b.w = [0, 0, 0]; }
+      }
     }
+    b.w = mul(b.w, 1 - 0.04 * dt);                              // a little air drag on the spin too
     const ws = len(b.w); if (ws > BALL.maxW) b.w = mul(b.w, BALL.maxW / ws);
   }
   // a car hitting the ball: a solid bounce plus the extra push that makes shots fly

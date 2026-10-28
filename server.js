@@ -15,7 +15,7 @@ const PORT = Number(process.env.PORT) || 8080;
 const PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'baseplatefps-e1fc1';
 const DATABASE_URL = process.env.FIREBASE_DATABASE_URL || 'https://baseplatefps-e1fc1-default-rtdb.asia-southeast1.firebasedatabase.app';
 const DEV_TOKENS = process.env.DEV_TOKENS === '1';           // local testing only, never set this on Render
-const PROTO = 6;
+const PROTO = 7;
 const EMAIL_DOMAIN = 'players.baseplatefps.game';
 const USER_RE = /^[A-Za-z0-9]{3,20}$/;
 
@@ -75,8 +75,10 @@ async function verifyToken(token) {
   return { uid: d.uid, email: d.email || '' };
 }
 
+// the anti-cheat: watches what every Baseplate FPS player sends, and quietly flags cheaters for the owner (fps-anticheat.js)
+let AC = null;
+function acCall(fn) { try { if (AC) fn(AC); } catch (e) { console.error('[anti-cheat]', e && e.stack || e); } }
 const modRec = new Map();     // uid -> { banned, tamperAt } — cheater warnings and bans, server-only
-const TAMPER_BAN_MS = (Number(process.env.TAMPER_BAN_S) || 5 * 60 * 60) * 1000;   // a second DevTools open within 5 hours is a ban
 
 async function loadProfile(who, requested, requestedSkins) {
   const fromEmail = String(who.email).split('@')[0];
@@ -109,23 +111,33 @@ async function loadProfile(who, requested, requestedSkins) {
   return { name, stats, avatar, saved, skins, savedSkins, grants, owner, verified, banned: (modRec.get(who.uid) || {}).banned };
 }
 
-function onTamper(p) {
-  const now = Date.now();
-  const rec = modRec.get(p.uid) || { banned: false, tamperAt: 0 };
-  if (rec.banned) return banPlayer(p, rec);
-  if (rec.tamperAt && now - rec.tamperAt < TAMPER_BAN_MS) { rec.banned = true; rec.tamperAt = now; modRec.set(p.uid, rec); banPlayer(p, rec); }
-  else {
-    rec.tamperAt = now; modRec.set(p.uid, rec);
-    if (db) db.ref('users/' + p.uid + '/mod').update({ tamperAt: admin.database.ServerValue.TIMESTAMP }).catch(e => console.warn('mod write failed', e.message));
-    console.log(`${p.name} warned for opening DevTools`);
-  }
-}
-function banPlayer(p, rec) {
-  if (db) db.ref('users/' + p.uid + '/mod').update({ banned: true, bannedAt: admin.database.ServerValue.TIMESTAMP }).catch(e => console.warn('ban write failed', e.message));
-  console.log(`${p.name} BANNED (repeat DevTools within 5h)`);
-  send(p, { t: 'err', code: 'banned' });
-  if (p.room) leaveRoom(p, 'banned');
-  setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 400);
+function onTamper(p) { acCall(A => A.onTamper(p)); }      // DevTools opened: never a warning or a ban, just a quiet flag for the owner
+
+// The page's integrity check-in rides inside normal updates as an opaque, lightly-scrambled blob (msg.q).
+// Only the server knows what the codes mean, so the page itself never spells out what it looks for.
+const AC_KEY = [0x5b, 0x27, 0x9e, 0x34, 0xc1, 0x6a, 0xf0, 0x82];
+const AC_CODE = {
+  1: 'WebSocket was replaced', 2: 'WebSocket send was replaced', 3: 'requestAnimationFrame was replaced',
+  4: 'Function toString was replaced', 5: 'JSON.parse was replaced', 6: 'JSON.stringify was replaced',
+  7: 'WebSocket onmessage was replaced', 8: 'the connection is not a real WebSocket',
+  10: 'an extra script was written straight into the page'
+};
+function decodeCheckin(q) {                                             // -> { findings:[strings], devtools:bool } or null
+  if (typeof q !== 'string' || q.length > 4096) return null;
+  try {
+    const bin = Buffer.from(q, 'base64'); if (!bin.length) return null;
+    const out = Buffer.allocUnsafe(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin[i] ^ AC_KEY[i % AC_KEY.length] ^ (i & 0xff);
+    const list = JSON.parse(out.toString('utf8'));
+    if (!Array.isArray(list)) return null;
+    const findings = []; let devtools = false;
+    for (const it of list.slice(1)) {                                  // index 0 is a throwaway nonce
+      if (Array.isArray(it) && it[0] === 12 && typeof it[1] === 'string') findings.push('a script from ' + it[1].replace(/[^\x20-\x7e]/g, '').slice(0, 90));
+      else if (it === 9) devtools = true;
+      else if (AC_CODE[it]) findings.push(AC_CODE[it]);
+    }
+    return { findings: findings.slice(0, 6), devtools };
+  } catch (_) { return null; }
 }
 
 function bestStreak(uid, n) {                                       // a record, not a running total
@@ -357,6 +369,7 @@ function tickRoom(room, dt) {
     cx: room.cx, cz: room.cz, res: room.result, al: alive, n, code: room.isPublic ? '' : room.code, tk: room.teamKills };
   if (room.phase === 'vote') { const { mc, pc } = tally(room); meta.vm = MODES.map(m => mc[m]); meta.vp = MAPS.MAP_LIST.map(m => pc[m]); }
   broadcast(room, { t: 's', m: meta, ps });
+  acCall(A => A.tickRoom(room, now));
 }
 
 setInterval(() => {
@@ -460,10 +473,11 @@ function onUpdate(p, msg) {
     const moved = Math.hypot(pos[0] - s.p[0], pos[2] - s.p[2]);
     // local tests use dev tokens and teleport bots around; AC_FORCE turns the checks on anyway to test them
     const check = p.alive && (!DEV_TOKENS || process.env.AC_FORCE);
-    const bad = check && (
-      moved > 9.5 * dtS + 1.5 ||                                           // faster than a sprint can carry you
-      MAPS.illegalStand(map, pos[0], pos[1], pos[2]) ||                    // inside a wall, or floating
-      MAPS.crossedWall(map, s.p[0], s.p[2], pos[0], pos[2], Math.min(s.p[1], pos[1])));   // stepped through a wall
+    const bad = !check ? '' :
+      moved > 9.5 * dtS + 1.5 ? 'too fast' :                               // faster than a sprint can carry you
+      MAPS.illegalStand(map, pos[0], pos[1], pos[2]) ? 'inside a wall or floating' :   // inside a wall, or floating
+      MAPS.crossedWall(map, s.p[0], s.p[2], pos[0], pos[2], Math.min(s.p[1], pos[1])) ? 'through a wall' : '';   // stepped through a wall
+    if (bad) acCall(A => A.onBadMove(p, now, bad));
     if (bad) {
       if (now - (p.lastFixAt || 0) > 500) { p.lastFixAt = now; send(p, { t: 'pos', p: s.p }); }   // snap them back
     } else { s.p = pos; p.lastPosAt = now; }
@@ -476,6 +490,11 @@ function onUpdate(p, msg) {
   if (h.length > 40) h.splice(0, h.length - 40);
   s.yw = num(msg.yw, s.yw); s.pt = clamp(num(msg.pt, s.pt), -1.6, 1.6);
   s.g = !!msg.g; s.sp = !!msg.sp; s.ad = !!msg.ad; s.rl = !!msg.rl; s.cr = !!msg.cr;
+  acCall(A => A.onUpdate(p, now));
+  if (msg.q !== undefined) {                                             // the integrity check-in folded into this update
+    const c = decodeCheckin(msg.q);
+    if (c) { acCall(A => A.onHeartbeat(p, { x: c.findings })); if (c.devtools) onTamper(p); }
+  }
   if (typeof msg.w === 'string' && msg.w !== s.w && p.loadout.includes(msg.w)) {
     // switching cancels a reload, like on the client; if the new mag was already in, the client kept it
     if (p.reloadUntil && p.reloadWeapon === s.w && now >= p.reloadStart + RELOAD_REFILL * WEAPONS[s.w].reload - 120) p.ammo[s.w] = WEAPONS[s.w].mag;
@@ -547,14 +566,15 @@ function rayCapsule(ox, oy, oz, dx, dy, dz, x, y0, y1, z, R) {           // an u
 function onShot(p, msg) {
   const room = p.room, now = Date.now(), wid = p.s.w, w = WEAPONS[wid];
   if (!room || !w || !p.alive || msg.w !== wid) return;
+  const ac = (r, t, hd) => acCall(A => A.onShot(p, msg, now, r, t || null, hd));
   if (now - p.wSince < SWITCH_LOCK_MS) return;                             // just switched weapons
   refreshAmmo(p, now);
-  if (p.reloadUntil && now < p.reloadUntil - RELOAD_SLACK_MS) return;      // still reloading
+  if (p.reloadUntil && now < p.reloadUntil - RELOAD_SLACK_MS) return ac('fast');   // still reloading
   // fire rate: a small bucket of shots that refills at the gun's rate, so jitter-bunched packets still count
   p.shotCredit = Math.min(SHOT_BURST, p.shotCredit + (now - p.creditAt) / (w.interval * 1000 * 0.92));
   p.creditAt = now;
-  if (p.shotCredit < 0.95) return;                                         // faster than the gun can fire
-  if (p.ammo[wid] <= 0) { startReload(p, now); return; }                   // out of ammo: no free shots
+  if (p.shotCredit < 0.95) return ac('fast');                              // faster than the gun can fire
+  if (p.ammo[wid] <= 0) { startReload(p, now); return ac('fast'); }        // out of ammo: no free shots
   p.shotCredit -= 1;
   p.ammo[wid]--;
   if (p.ammo[wid] <= 0) startReload(p, now);
@@ -564,31 +584,33 @@ function onShot(p, msg) {
   const se = vec3(msg.se, 3000); if (se) p.se = se.map(r2);
 
   const target = msg.hit ? room.players.get(Number(msg.hit)) : null;
-  if (!target || target === p || !target.alive || room.phase !== 'live' || !inRound(room, p) || !inRound(room, target)) return;
-  if (room.mode === 'tdm' && target.team === p.team) return;              // no friendly fire
-  if (now < target.protectUntil) return;
+  if (!msg.hit) return ac('miss');
+  if (!target || target === p || !target.alive || room.phase !== 'live' || !inRound(room, p) || !inRound(room, target)) return ac('miss');
+  if (room.mode === 'tdm' && target.team === p.team) return ac('miss');    // no friendly fire
+  if (now < target.protectUntil) return ac('miss');
   const map = mapOf(room), half = map.half + 2;
   const o = vec3(msg.o, half + 20), d = vec3(msg.d, 2), tp = vec3(msg.tp, half + 20);
-  if (!o || !d || !tp) return;
+  if (!o || !d || !tp) return ac('missing data', target);
   // the shot has to start at the shooter's own eyes
-  if (Math.hypot(o[0] - p.s.p[0], o[2] - p.s.p[2]) > 2 || Math.abs(o[1] - (p.s.p[1] + 1.65)) > 1.3) return;
-  const dl = Math.hypot(d[0], d[1], d[2]); if (dl < 0.5) return;
+  if (Math.hypot(o[0] - p.s.p[0], o[2] - p.s.p[2]) > 2 || Math.abs(o[1] - (p.s.p[1] + 1.65)) > 1.3) return ac('fired from the wrong place', target);
+  const dl = Math.hypot(d[0], d[1], d[2]); if (dl < 0.5) return ac('broken shot', target);
   const dx = d[0] / dl, dy = d[1] / dl, dz = d[2] / dl;
   // ...roughly the way they were looking (a generous cone: flicks happen between updates)
   const cp = Math.cos(p.s.pt);
-  if (dx * -Math.sin(p.s.yw) * cp + dy * Math.sin(p.s.pt) + dz * -Math.cos(p.s.yw) * cp < 0.35) return;
+  if (dx * -Math.sin(p.s.yw) * cp + dy * Math.sin(p.s.pt) + dz * -Math.cos(p.s.yw) * cp < 0.35) return ac('shot nowhere near their aim', target);
   // ...at a target drawn where it really was a moment ago
-  if (!onTargetPath(target, tp[0], tp[1], tp[2], now)) return;
+  if (!onTargetPath(target, tp[0], tp[1], tp[2], now)) return ac('target was never there', target);
   // ...and actually pass through the body there (same shapes the client tests, a hair bigger)
   const [clo, chi] = crouchRange(target, now), tc = clamp(num(msg.tc, 0), clo, chi), drop = CROUCH_DROP * tc;
   const tHead = raySphere(o[0], o[1], o[2], dx, dy, dz, tp[0], tp[1] + 1.66 - drop, tp[2], 0.18);
   const tBody = rayCapsule(o[0], o[1], o[2], dx, dy, dz, tp[0], tp[1] + 0.12, tp[1] + 1.42 - drop, tp[2], 0.3);
-  if (tHead < 0 && tBody < 0) return;
+  if (tHead < 0 && tBody < 0) return ac('bullet missed the body', target);
   const head = tHead >= 0 && (tBody < 0 || tHead <= tBody + 0.05);         // the server decides headshots, not the client
   const dist = head ? tHead : tBody;
-  if (dist > w.range + 4) return;
+  if (dist > w.range + 4) return ac('out of range', target);
   // no wall between the shooter and where the shot lands
-  if (MAPS.blocked(map, o[0], o[1], o[2], o[0] + dx * dist, o[1] + dy * dist, o[2] + dz * dist)) return;
+  if (MAPS.blocked(map, o[0], o[1], o[2], o[0] + dx * dist, o[1] + dy * dist, o[2] + dz * dist)) return ac('wall', target);
+  ac('ok', target, head);
 
   let dmg = head ? w.head : w.body;
   if (w.falloffAt && dist > w.falloffAt) dmg = Math.round(dmg * w.falloff);
@@ -660,7 +682,7 @@ async function onAdmin(req, res) {
   if (!me) return adminSend(res, 403, { error: 'Only the owner can do that.' });
   const now = Date.now();                                          // and even the owner's page can't flood it
   while (adminLog.length && now - adminLog[0] > 60000) adminLog.shift();
-  if (adminLog.length >= 40) return adminSend(res, 429, { error: 'Too many requests. Wait a minute.' });
+  if (adminLog.length >= 150) return adminSend(res, 429, { error: 'Too many requests. Wait a minute.' });
   adminLog.push(now);
   if (req.method === 'GET' && req.url === '/admin/players') {
     const list = [];
@@ -675,6 +697,23 @@ async function onAdmin(req, res) {
     res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'access-control-allow-origin': '*', 'cache-control': 'no-store' });
     res.end(ADMIN_PANEL); return;
   }
+  if (req.method === 'GET' && req.url === '/admin/flags') return adminSend(res, 200, { flags: AC ? AC.list() : [] });
+  if (req.method === 'GET' && req.url.startsWith('/admin/flag?id=')) {
+    const f = AC && AC.get(decodeURIComponent(req.url.slice(15)).slice(0, 40));
+    return f ? adminSend(res, 200, { flag: f }) : adminSend(res, 404, { error: 'That flag is gone.' });
+  }
+  if (req.method === 'POST' && req.url === '/admin/flag') {
+    let body; try { body = await readBody(req, 512); } catch (_) { return adminSend(res, 400, { error: 'Bad request.' }); }
+    const f = AC && AC.get(String(body.id || '').slice(0, 40));
+    if (!f) return adminSend(res, 404, { error: 'That flag is gone.' });
+    if (body.action === 'reject') { AC.resolve(f.id); console.log(`${me.name} rejected the ${f.kind} flag on ${f.name}`); return adminSend(res, 200, { ok: true, msg: `Flag on ${f.name} rejected.` }); }
+    if (body.action !== 'approve') return adminSend(res, 400, { error: 'Bad request.' });
+    if (COS.isOwner(String(f.name).toLowerCase())) { AC.resolve(f.id); return adminSend(res, 400, { error: "Owners can't be banned." }); }
+    AC.resolve(f.id);
+    const r = await banAccount({ uid: f.uid, name: f.name }, me);
+    AC.dropFor(f.uid);
+    return adminSend(res, 200, r);
+  }
   if (req.method !== 'POST' || !['/admin/ban', '/admin/unban'].includes(req.url)) return adminSend(res, 404, { error: 'Unknown request.' });
   let body; try { body = await readBody(req, 512); } catch (_) { return adminSend(res, 400, { error: 'Bad request.' }); }
   const name = typeof body.name === 'string' ? body.name.trim() : '';
@@ -682,7 +721,15 @@ async function onAdmin(req, res) {
   if (COS.isOwner(name)) return adminSend(res, 400, { error: "Owners can't be banned." });
   const acct = await findAccount(name);
   if (!acct) return adminSend(res, 404, { error: `No account called ${name}.` });
-  if (req.url === '/admin/ban') {
+  if (req.url === '/admin/ban') return adminSend(res, 200, await banAccount(acct, me));
+  modRec.set(acct.uid, { banned: false, tamperAt: 0 });
+  if (db) await db.ref('users/' + acct.uid + '/mod').remove().catch(e => console.warn('unban write failed', e.message));
+  console.log(`${me.name} unbanned ${acct.name}`);
+  return adminSend(res, 200, { ok: true, name: acct.name, msg: `${acct.name} is unbanned.` });
+}
+// a ban: saved, and kicked out of every game at once
+async function banAccount(acct, me) {
+  {
     modRec.set(acct.uid, { banned: true, tamperAt: Date.now() });
     if (db) await db.ref('users/' + acct.uid + '/mod').update({ banned: true, bannedAt: admin.database.ServerValue.TIMESTAMP, bannedBy: me.name }).catch(e => console.warn('ban write failed', e.message));
     const p = byUid.get(acct.uid);
@@ -693,17 +740,17 @@ async function onAdmin(req, res) {
     const kickedHB = !!hbCall(x => x.kick(acct.uid, 'banned'), false);                                     // and Highway Bike
     const online = !!p || kickedRL || kickedOCB || kickedSurf || kickedHB;
     console.log(`${me.name} banned ${acct.name}${online ? ' (kicked from the match)' : ''}`);
-    return adminSend(res, 200, { ok: true, name: acct.name, online, msg: online ? `${acct.name} is banned and was kicked.` : `${acct.name} is banned.` });
+    return { ok: true, name: acct.name, online, msg: online ? `${acct.name} is banned and was kicked.` : `${acct.name} is banned.` };
   }
-  modRec.set(acct.uid, { banned: false, tamperAt: 0 });
-  if (db) await db.ref('users/' + acct.uid + '/mod').remove().catch(e => console.warn('unban write failed', e.message));
-  console.log(`${me.name} unbanned ${acct.name}`);
-  return adminSend(res, 200, { ok: true, name: acct.name, msg: `${acct.name} is unbanned.` });
 }
 
 /* ---------- RockLeague (the arcade's car football game) ----------
    It lives in its own file with its own connections and game loop. If it ever fails to load or
    throws, Baseplate FPS carries on exactly as before. */
+try {
+  AC = require('./fps-anticheat.js')({ MAPS, mapOf, getDb: () => db, admin, enabled: () => !DEV_TOKENS || !!process.env.AC_FORCE });
+  console.log('Anti-cheat is watching Baseplate FPS');
+} catch (e) { console.error('Anti-cheat failed to start (the games are unaffected):', e && e.message); }
 let RL = null;
 try {
   RL = require('./rockleague.js')({ admin, getDb: () => db, verifyToken, modRec, knownNames, USER_RE, EMAIL_DOMAIN, DEV_TOKENS, isOwner: n => COS.isOwner(n), isOwnerWho });
@@ -781,14 +828,14 @@ wss.on('connection', ws => {
     let msg; try { msg = JSON.parse(raw); } catch (_) { return; }
     if (!msg || typeof msg !== 'object') return;
     if (!p.authed) { if (msg.t === 'hello' && !p.helloSeen) { p.helloSeen = true; onHello(p, msg).catch(e => { console.error(e); ws.close(); }); } return; }
-    if (msg.t === 'tamper') { onTamper(p); return; }                        // DevTools opened on their page
     if (p.watcher) { if (msg.t === 'leave') ws.close(); return; }          // watchers only watch
     if (!p.room) return;
-    if (msg.t === 'u') onUpdate(p, msg);
+    if (msg.t === 'u') onUpdate(p, msg);                                    // the check-in rides inside the update (msg.q)
     else if (msg.t === 'f') onShot(p, msg);
     else if (msg.t === 'reload') onReload(p);
     else if (msg.t === 'vote') onVote(p, msg);
     else if (msg.t === 'leave') { leaveRoom(p, 'left'); ws.close(); }
+    else acCall(A => A.onOdd(p, msg.t));                                        // the real game never sends anything else (old 'ac'/'tamper' now count as odd)
   });
   ws.on('close', () => { clearTimeout(helloTimer); if (p.watcher) { if (p.watchRoom) p.watchRoom.watchers.delete(p); return; } if (p.room) leaveRoom(p, 'disconnected'); });
   ws.on('error', () => {});
