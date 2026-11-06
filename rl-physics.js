@@ -84,10 +84,17 @@
   function newWorld() {
     return { tick: 0, ball: { p: [0, BALL.r, 0], v: [0, 0, 0], w: [0, 0, 0] }, cars: [], pads: PADS.map(() => 0) };
   }
+  // 2v2: each kickoff gives the two teammates two different spots (the other team gets the mirror)
+  const KICKOFF_PAIRS = [[0, 1], [2, 3], [0, 3], [1, 2], [4, 0]];
   function kickoffPlace(world, spotIndex) {        // spotIndex picks one of the five spots; the opponent gets the mirror
     world.ball = { p: [0, BALL.r, 0], v: [0, 0, 0], w: [0, 0, 0] };
+    const mates = [[], []];
+    for (const c of world.cars) mates[c.team === 1 ? 1 : 0].push(c);
+    for (const m of mates) m.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     for (const c of world.cars) {
-      const [sx, sz] = KICKOFFS[spotIndex % KICKOFFS.length];
+      const m = mates[c.team === 1 ? 1 : 0], k = m.indexOf(c);
+      const spot = m.length >= 2 ? KICKOFF_PAIRS[spotIndex % KICKOFF_PAIRS.length][k % 2] : spotIndex % KICKOFFS.length;
+      const [sx, sz] = KICKOFFS[spot];
       const x = c.team === 0 ? sx : -sx, z = c.team === 0 ? sz : -sz;
       const yaw = Math.atan2(-x, -z);             // face the ball
       Object.assign(c, newCar(c.id, c.team), { p: [x, CAR.ride, z], q: qFromYaw(yaw), boost: 33.3, pw: c.pw || 0, fz: c.fz || 0 });

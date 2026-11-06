@@ -15,7 +15,7 @@ const PORT = Number(process.env.PORT) || 8080;
 const PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'baseplatefps-e1fc1';
 const DATABASE_URL = process.env.FIREBASE_DATABASE_URL || 'https://baseplatefps-e1fc1-default-rtdb.asia-southeast1.firebasedatabase.app';
 const DEV_TOKENS = process.env.DEV_TOKENS === '1';           // local testing only, never set this on Render
-const PROTO = 7;
+const PROTO = 8;
 const EMAIL_DOMAIN = 'players.baseplatefps.game';
 const USER_RE = /^[A-Za-z0-9]{3,20}$/;
 
@@ -23,7 +23,7 @@ const TICK_HZ = 15;
 const START_S = Number(process.env.START_S) || 6;            // everyone spawns and reads the round explainer
 const ROUND_S = Number(process.env.ROUND_S) || 600;          // 10 minute rounds
 const VOTE_S = Number(process.env.VOTE_S) || 20;             // vote for the next map and mode
-const RESPAWN_MS = 3000, PROTECT_MS = 2000, LEAVE_HURT_MS = 10000;
+const RESPAWN_MS = Number(process.env.RESPAWN_MS) || 3000, PROTECT_MS = 2000, LEAVE_HURT_MS = 10000;
 const GRACE_S = 25, SHRINK_S = 180, ZONE_DPS = 4;            // last man standing only
 const PUBLIC_MAX = 50, PRIVATE_MAX = 16;
 const MODES = ['tdm', 'ffa', 'lms'];
@@ -77,6 +77,7 @@ async function verifyToken(token) {
 
 // the anti-cheat: watches what every Baseplate FPS player sends, and quietly flags cheaters for the owner (fps-anticheat.js)
 let AC = null;
+let BANK = null;                                              // cash, crates and wraps (fps-bank.js): only the server changes them
 function acCall(fn) { try { if (AC) fn(AC); } catch (e) { console.error('[anti-cheat]', e && e.stack || e); } }
 const modRec = new Map();     // uid -> { banned, tamperAt } — cheater warnings and bans, server-only
 
@@ -270,6 +271,8 @@ function endRound(room) {
   }
   for (const p of ps) addStats(p.uid, { matches: 1 });
   for (const p of winners) addStats(p.uid, { wins: 1 });
+  if (ps.length >= CASH_MIN_PLAYERS) for (const p of winners) payCash(room, p, 'win');
+  room.cashPairs = new Map();                                       // the kill-pair limit starts over each round
   room.result = text;
   room.phase = 'vote'; room.t = 0;
   for (const p of room.players.values()) { p.voteMode = ''; p.voteMap = ''; }
@@ -286,6 +289,25 @@ function winnerOf(counts, current) {
   return pick(Object.keys(counts).filter(k => counts[k] === top));   // a tie: one of the tied options at random
 }
 
+// cash: 10 a kill and 100 a win, decided only here. A round needs 3 or more players in it to pay, and one player
+// only earns from killing the same person a few times a round, so two accounts can't farm each other.
+const CASH_MIN_PLAYERS = 3, CASH_PAIR_LIMIT = 6;
+function payCash(room, p, why, victim) {
+  if (!BANK || !p || !p.uid) return;
+  const inIt = [...room.players.values()].filter(q => inRound(room, q)).length;
+  if (inIt < CASH_MIN_PLAYERS) return;
+  if (why === 'kill') {
+    if (!victim || victim.uid === p.uid) return;
+    if (!room.cashPairs) room.cashPairs = new Map();
+    const key = p.uid + '>' + victim.uid, n = room.cashPairs.get(key) || 0;
+    if (n >= CASH_PAIR_LIMIT) return;
+    room.cashPairs.set(key, n + 1);
+  }
+  const amt = why === 'win' ? COS.CASH.win : COS.CASH.kill;
+  const total = BANK.addCash(p.uid, amt);
+  send(p, { t: 'cash', n: amt, why, total: total == null ? -1 : total });
+}
+
 function kill(room, victim, killer, weapon, head, byZone, quit) {
   if (!victim.alive) return;
   victim.alive = false; victim.hp = 0;
@@ -300,6 +322,7 @@ function kill(room, victim, killer, weapon, head, byZone, quit) {
       if (head) add.headshots = 1;
       if (WEAPONS[weapon]) add[weapon + 'Kills'] = 1;
       addStats(killer.uid, add);
+      payCash(room, killer, 'kill', victim);
       killer.streak = (killer.streak || 0) + 1;
       bestStreak(killer.uid, killer.streak);
     }
@@ -308,7 +331,11 @@ function kill(room, victim, killer, weapon, head, byZone, quit) {
   }
   const place = room.mode === 'lms' ? aliveIn(room).length + 1 : 0;
   broadcast(room, { t: 'kill', k: killer ? killer.name : '', v: victim.name, w: weapon || '', hs: head ? 1 : 0, z: byZone ? 1 : 0, left: quit ? 1 : 0 });
-  if (!quit) send(victim, { t: 'died', by: byZone ? 'the zone' : killer ? killer.name : '', byId: killer && !byZone ? killer.id : 0, place, respawn: room.mode !== 'lms' && live ? RESPAWN_MS : 0 });
+  if (!quit) {
+    const kc = killer && !byZone && killer !== victim ? killer : null, ks = kc ? memStats.get(kc.uid) || blankStats() : null;
+    send(victim, { t: 'died', by: byZone ? 'the zone' : killer ? killer.name : '', byId: killer && !byZone ? killer.id : 0, place, respawn: room.mode !== 'lms' && live ? RESPAWN_MS : 0,
+      card: kc ? { n: kc.name, w: weapon || kc.s.w, k: ks.kills || 0, d: ks.deaths || 0, mk: kc.kills, md: kc.deaths, cos: kc.cos, sk: kc.skins, wr: kc.wraps || '', hs: head ? 1 : 0, team: kc.team } : null });
+  }
   console.log(`${room.code}: ${byZone ? 'the zone' : killer ? killer.name : '?'} eliminated ${victim.name}${weapon ? ' (' + weapon + (head ? ', headshot' : '') + ')' : ''}${quit ? ' (left the match)' : ''}`);
 }
 
@@ -363,7 +390,7 @@ function tickRoom(room, dt) {
     if (p.alive && ir) alive++;
     const flags = (s.g ? 1 : 0) | (s.sp ? 2 : 0) | (s.ad ? 4 : 0) | (s.rl ? 8 : 0) | (p.alive ? 16 : 0) | (ir ? 32 : 0) | (now < p.protectUntil ? 64 : 0) | (s.cr ? 128 : 0);
     ps.push([p.id, p.name, s.p[0], s.p[1], s.p[2], s.v[0], s.v[1], s.v[2], s.yw, s.pt, flags,
-      WEAPON_LIST.indexOf(s.w), p.shots, p.se[0], p.se[1], p.se[2], Math.max(0, Math.ceil(p.hp)), p.cos, p.kills, p.team, p.deaths, p.skins]);
+      WEAPON_LIST.indexOf(s.w), p.shots, p.se[0], p.se[1], p.se[2], Math.max(0, Math.ceil(p.hp)), p.cos, p.kills, p.team, p.deaths, p.skins, p.wraps || '']);
   }
   const meta = { rid: room.rid, phase: room.phase, t: r2(room.t), dur: phaseDur(room), mode: room.mode, map: room.map,
     cx: room.cx, cz: room.cz, res: room.result, al: alive, n, code: room.isPublic ? '' : room.code, tk: room.teamKills };
@@ -456,9 +483,12 @@ async function onHello(p, msg) {
   const skins = Object.fromEntries(COS.WEAPON_LIST.map(w => [w, COS.skinUnlocked(w, prof.skins[w], prof.owner, prof.grants, prof.verified) ? prof.skins[w] : 'default']));
   p.skins = COS.WEAPON_LIST.map(w => skins[w] === 'default' ? '' : skins[w]).join('|');
   if (db && COS.WEAPON_LIST.some(w => !prof.savedSkins || prof.savedSkins[w] !== skins[w])) db.ref('users/' + who.uid + '/skins').set(skins).catch(e => console.warn('skins not saved for', who.uid, e.message));
+  const bank = BANK ? await BANK.load(who.uid, prof.owner).catch(() => null) : null;
+  if (p.ws.readyState !== 1) return;
+  p.wraps = BANK && bank ? BANK.wrapsFor(bank, skins) : '';
   p.s.w = p.loadout[0]; p.wSince = 0;
   byUid.set(p.uid, p);
-  send(p, { t: 'welcome', id: p.id, name: p.name, cos: p.cos, skins: p.skins, room: room.isPublic ? '' : room.code, pub: room.isPublic, max: room.max,
+  send(p, { t: 'welcome', id: p.id, name: p.name, cos: p.cos, skins: p.skins, wraps: p.wraps, cash: bank ? bank.cash : 0, room: room.isPublic ? '' : room.code, pub: room.isPublic, max: room.max,
     modes: MODES, maps: MAPS.MAP_LIST, roundS: ROUND_S, voteS: VOTE_S });
   joinRoom(p, room);
   console.log(`${p.name} joined ${room.code} (${room.players.size} players)`);
@@ -748,6 +778,10 @@ async function banAccount(acct, me) {
    It lives in its own file with its own connections and game loop. If it ever fails to load or
    throws, Baseplate FPS carries on exactly as before. */
 try {
+  BANK = require('./fps-bank.js')({ COS, getDb: () => db, admin, verifyToken, modRec, isOwnerWho });
+  console.log('Cash and crates are on');
+} catch (e) { console.error('Cash and crates failed to start (the games are unaffected):', e && e.message); }
+try {
   AC = require('./fps-anticheat.js')({ MAPS, mapOf, getDb: () => db, admin, enabled: () => !DEV_TOKENS || !!process.env.AC_FORCE });
   console.log('Anti-cheat is watching Baseplate FPS');
 } catch (e) { console.error('Anti-cheat failed to start (the games are unaffected):', e && e.message); }
@@ -785,6 +819,15 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({ players: n, public: { players: pub.players.size, mode: pub.mode, map: pub.map, phase: pub.phase }, rockleague: rlCall(r => r.status(), null), othercolourbike: ocbCall(r => r.status(), null), swellsurf: surfCall(r => r.status(), null), highwaybike: hbCall(r => r.status(), null) }));
     return;
   }
+  if (req.url.startsWith('/fps/')) {
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, { 'access-control-allow-origin': '*', 'access-control-allow-headers': 'authorization, content-type', 'access-control-allow-methods': 'GET, POST', 'access-control-max-age': '600' });
+      res.end(); return;
+    }
+    if (!BANK) { res.writeHead(503, { 'access-control-allow-origin': '*' }); res.end(); return; }
+    BANK.handle(req, res).catch(e => { console.error('bank error', e.message); try { res.writeHead(500, { 'content-type': 'application/json', 'access-control-allow-origin': '*' }); res.end('{"error":"Something went wrong."}'); } catch (_) {} });
+    return;
+  }
   if (req.url.startsWith('/admin/')) {
     if (req.method === 'OPTIONS') {
       res.writeHead(204, { 'access-control-allow-origin': '*', 'access-control-allow-headers': 'authorization, content-type', 'access-control-allow-methods': 'GET, POST', 'access-control-max-age': '600' });
@@ -797,6 +840,10 @@ const server = http.createServer((req, res) => {
   res.writeHead(200, { 'content-type': 'text/plain', 'access-control-allow-origin': '*' });
   if (DEV_TOKENS && req.url === '/stats') { res.end(JSON.stringify(Object.fromEntries(memStats))); return; }
   if (DEV_TOKENS && req.url === '/mod') { res.end(JSON.stringify(Object.fromEntries(modRec))); return; }
+  if (DEV_TOKENS && req.url.startsWith('/dev/cash?') && BANK) {      // local tests only: never available when DEV_TOKENS is off (it always is on Render)
+    const q = new URLSearchParams(req.url.slice(10)); const uid = String(q.get('uid') || ''), n = Math.floor(Number(q.get('n')) || 0);
+    if (uid && n > 0) { BANK.addCash(uid, n); res.end(String((BANK.peek(uid) || {}).cash)); } else res.end('bad'); return;
+  }
   const pub = rooms.get('PUBLIC');
   res.end(`Baseplate FPS game server is running. ${players} playing right now. Public match: ${MODE_NAMES[pub.mode]} on ${mapOf(pub).name} (${pub.phase}).\n`);
 });

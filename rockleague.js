@@ -12,7 +12,7 @@
 const { WebSocketServer } = require('ws');
 const P = require('./rl-physics.js');
 
-const RL_PROTO = 3;
+const RL_PROTO = 4;
 const MATCH_S = 300;                     // five minute matches
 const COUNT_S = 3;                       // kickoff countdown
 const GOAL_S = 3;                        // celebration after a goal
@@ -21,6 +21,8 @@ const SNAP_EVERY = 4;                    // 120 / 4 = 30 snapshots a second
 const QUEUE_MAX = 36;                    // controls a player may have waiting (0.3 s); older ones are dropped
 const STARVE_IDLE = 18;                  // no controls arriving for 0.15 s: let go of everything
 const MAX_ROOMS = 60;
+const READY_S = 2.5;                     // 2v2: everyone's in, a moment on the lobby screen before kickoff
+const INVITE_MS = Number(process.env.RL_INVITE_MS) || 5000;                  // a 2v2 invite lasts five seconds
 const BODIES = ['breaker', 'dune', 'pebble'];
 const ACCENTS = ['#f5f5f5', '#1c1c1c', '#ffd23f', '#3fd17a', '#b56cff', '#ff5fa2', '#4fd8ff', '#ff7a2f'];
 const STAT_KEYS = ['played', 'wins', 'losses', 'goals', 'shots', 'saves', 'demos', 'mvps'];
@@ -36,6 +38,7 @@ module.exports = function createRockLeague(ctx) {
   const rooms = new Map();               // id -> room
   const codes = new Map();               // private code -> room
   const queue = [];                      // quick match
+  const invites = new Map();             // invite id -> { id, from, to, exp }: kept here, so nobody can fake or stretch one
   const memStats = new Map();
   let nextId = 1, nextRoom = 1;
   const blank = () => Object.fromEntries(STAT_KEYS.map(k => [k, 0]));
@@ -83,9 +86,10 @@ module.exports = function createRockLeague(ctx) {
     for (let n = 0; n < 50; n++) { let c = ''; for (let i = 0; i < 4; i++) c += A[Math.floor(Math.random() * A.length)]; if (!codes.has(c)) return c; }
     return null;
   }
-  function newRoom(isPrivate) {
+  function newRoom(isPrivate, size) {
     if (rooms.size >= MAX_ROOMS) return null;
-    const room = { id: nextRoom++, code: isPrivate ? makeCode() : null, isPrivate, seats: [null, null], watchers: new Set(), world: P.newWorld(), phase: 'wait', pt: 0,
+    size = size === 2 ? 2 : 1;
+    const room = { id: nextRoom++, code: isPrivate ? makeCode() : null, isPrivate, size, seats: new Array(size * 2).fill(null), gone: [], watchers: new Set(), world: P.newWorld(), phase: 'wait', pt: 0,
       clock: MATCH_S * 120, ot: false, score: [0, 0], ev: [], lastTouch: null, st: {}, rematch: new Set(), zeroWait: 0, startTick: 0, forfeit: null, mvp: null };
     if (isPrivate && !room.code) return null;
     room.world.ball.p = [0, P.BALL.r, 0];
@@ -98,26 +102,31 @@ module.exports = function createRockLeague(ctx) {
     if (room.code) codes.delete(room.code);
   }
   const seated = room => room.seats.filter(Boolean);
+  const teamOfSeat = (room, i) => (i < room.size ? 0 : 1);               // 2v2: seats 0-1 are Blue, 2-3 are Orange
+  const teamCount = (room, t) => room.seats.filter((p, i) => p && teamOfSeat(room, i) === t).length;
   function roomInfo(room) {
-    return { t: 'room', code: room.code, priv: room.isPrivate, phase: room.phase,
-      seats: room.seats.map(p => p ? { id: p.cid, name: p.name, team: p.team, body: p.car.body, accent: p.car.accent } : null) };
+    return { t: 'room', code: room.code, priv: room.isPrivate, phase: room.phase, size: room.size,
+      seats: room.seats.map((p, i) => p ? { id: p.cid, name: p.name, team: teamOfSeat(room, i), body: p.car.body, accent: p.car.accent, mate: p.mate ? p.mate.cid : '' } : null) };
   }
   function broadcast(room, obj) { const s = JSON.stringify(obj); for (const p of seated(room)) send(p, s); for (const w of room.watchers) send(w, s); }
-  function seat(room, p, team) {
-    room.seats[team] = p; p.room = room; p.team = team;
+  function seat(room, p, idx) {
+    const team = teamOfSeat(room, idx);
+    room.seats[idx] = p; p.room = room; p.team = team; p.seat = idx;
     p.q = []; p.ack = p.lastSeq; p.last = P.IDLE; p.starve = 0;
     const c = P.newCar(p.cid, team); c.pw = p.power ? 1 : 0;
     room.world.cars = room.world.cars.filter(x => x.id !== p.cid).concat(c);
     room.world.cars.sort((a, b) => a.team - b.team);
-    const s = room.seats[1 - team];
     // a fresh car sits on its own half until the match starts
-    Object.assign(c, { p: [0, P.CAR.ride, team === 0 ? -30 : 30], q: team === 0 ? [0, 0, 0, 1] : [0, 1, 0, 0] });
-    if (s) startMatch(room);
-    else { room.phase = 'wait'; broadcast(room, roomInfo(room)); }
+    const sx = room.size === 2 ? (idx % 2 ? 7 : -7) : 0;
+    Object.assign(c, { p: [sx, P.CAR.ride, team === 0 ? -30 : 30], q: team === 0 ? [0, 0, 0, 1] : [0, 1, 0, 0] });
+    if (room.seats.every(Boolean)) {
+      if (room.size === 2) { room.phase = 'ready'; room.pt = Math.round(READY_S * 120); broadcast(room, roomInfo(room)); }   // the lobby shows all four, then kickoff
+      else startMatch(room);
+    } else { room.phase = 'wait'; broadcast(room, roomInfo(room)); }
   }
   function startMatch(room) {
     room.score = [0, 0]; room.clock = MATCH_S * 120; room.ot = false; room.zeroWait = 0; room.forfeit = null; room.mvp = null;
-    room.rematch.clear(); room.lastTouch = null; room.statsSaved = false;
+    room.rematch.clear(); room.lastTouch = null; room.statsSaved = false; room.gone = [];
     room.st = {}; for (const p of seated(room)) room.st[p.cid] = { goals: 0, shots: 0, saves: 0, demos: 0, score: 0, lastShot: -999 };
     room.startTick = room.world.tick;
     kickoff(room);
@@ -132,9 +141,12 @@ module.exports = function createRockLeague(ctx) {
     const room = p.room; if (!room) return;
     for (const w of room.watchers) if (w.watchTarget === p) { room.watchers.delete(w); send(w, { t: 'err', code: 'watchend' }); }
     p.room = null; p.frozen = false;
-    room.seats[p.team] = null;
+    const si = room.seats.indexOf(p); if (si >= 0) room.seats[si] = null;
     if (p.owner) for (const o of seated(room)) o.frozen = false;   // the owner leaving unfreezes everyone
     room.world.cars = room.world.cars.filter(c => c.id !== p.cid);
+    if (p.mate && p.mate.mate === p) p.mate.mate = null;
+    p.mate = null;
+    if (room.size === 2) return leave2(room, p, why);
     const other = seated(room)[0];
     const live = room.phase === 'count' || room.phase === 'play' || room.phase === 'goal';
     if (live && other) {
@@ -154,19 +166,35 @@ module.exports = function createRockLeague(ctx) {
       other.room = null; closeRoom(room);
     }
   }
+  function leave2(room, p, why) {
+    const left = seated(room);
+    if (!left.length) { closeRoom(room); return; }
+    const live = room.phase === 'count' || room.phase === 'play' || room.phase === 'goal';
+    if (live) {
+      room.gone.push({ cid: p.cid, uid: p.uid, name: p.name, team: p.team });           // still counts in this match's results, as a loss
+      broadcast(room, { t: 'left', name: p.name, why });
+      if (!teamCount(room, p.team)) { room.forfeit = p.cid; endMatch(room, 1 - p.team, p); }   // their whole team has gone
+      broadcast(room, roomInfo(room));
+      return;
+    }
+    if (room.phase === 'ready') room.phase = 'wait';                                    // someone left the full lobby: wait for another
+    broadcast(room, { t: 'left', name: p.name, why });
+    broadcast(room, roomInfo(room));
+  }
   function endMatch(room, winner, leaver) {
     if (room.phase === 'over') return;
     room.phase = 'over'; room.pt = 0;
-    const list = seated(room).concat(leaver ? [leaver] : []);
-    // the player of the match: the winner, unless the loser outplayed them by a long way
+    const list = seated(room).concat(room.gone || []).concat(leaver && !(room.gone || []).some(g => g.cid === leaver.cid) ? [leaver] : []);
+    // the player of the match: the best score on the winning team
     let mvp = null; for (const p of list) { const s = room.st[p.cid]; if (!s) continue; s.score = s.goals * 100 + s.shots * 20 + s.saves * 50 + s.demos * 15; }
-    const w = list.find(p => p.team === winner); if (w) mvp = w.cid;
+    let best = -1; for (const p of list) if (p.team === winner && seated(room).includes(p)) { const sc = (room.st[p.cid] || {}).score || 0; if (sc > best) { best = sc; mvp = p.cid; } }
+    if (mvp === null) { const w = list.find(p => p.team === winner); if (w) mvp = w.cid; }
     room.mvp = mvp;
     if (!room.statsSaved) {
       room.statsSaved = true;
       for (const p of list) {
         const s = room.st[p.cid] || {};
-        const won = p.team === winner;
+        const won = p.team === winner && !(room.gone || []).some(g => g.cid === p.cid);   // leaving early is a loss
         saveStats(p.uid, { played: 1, wins: won ? 1 : 0, losses: won ? 0 : 1, goals: s.goals || 0, shots: s.shots || 0, saves: s.saves || 0, demos: s.demos || 0, mvps: mvp === p.cid ? 1 : 0 });
       }
     }
@@ -188,7 +216,7 @@ module.exports = function createRockLeague(ctx) {
       else { p.starve++; inp = p.starve > STARVE_IDLE ? P.IDLE : p.last; }
       inputs[p.cid] = inp;
     }
-    const frozen = room.phase === 'count', noBall = room.phase === 'goal' || room.phase === 'over';
+    const frozen = room.phase === 'count' || room.phase === 'ready' || (room.size === 2 && room.phase === 'wait'), noBall = room.phase === 'goal' || room.phase === 'over';
     const ballBefore = { p: w.ball.p.slice(), v: w.ball.v.slice(), w: w.ball.w.slice() };
     const ev = P.step(w, inputs, frozen, noBall);
     for (const e of ev) {
@@ -208,6 +236,7 @@ module.exports = function createRockLeague(ctx) {
         room.ev.push({ t: 'demo', id: e.id, victim: e.victim, p: e.p.map(v => Math.round(v * 100) / 100) });
       }
     }
+    if (room.phase === 'ready') { if (--room.pt <= 0) startMatch(room); return; }
     if (room.phase === 'count') { if (--room.pt <= 0) { room.phase = 'play'; room.ev.push({ t: 'go' }); } }
     else if (room.phase === 'play') {
       const g = P.goalCheck(w.ball);
@@ -266,6 +295,75 @@ module.exports = function createRockLeague(ctx) {
 
   /* ---------- messages ---------- */
   function unqueue(p) { const i = queue.indexOf(p); if (i >= 0) queue.splice(i, 1); }
+  // 2v2: public lobbies fill seat by seat. A pair from an invite always gets a whole team; a solo player takes any free seat.
+  function lobby2(need) {
+    let best = null;
+    for (const r of rooms.values()) {
+      if (r.size !== 2 || r.isPrivate || r.phase !== 'wait') continue;
+      const free0 = r.size - teamCount(r, 0), free1 = r.size - teamCount(r, 1);
+      if (need === 2 ? !(free0 === 2 || free1 === 2) : free0 + free1 < 1) continue;
+      if (!best || seated(r).length > seated(best).length) best = r;                  // the fullest lobby first, so games start sooner
+    }
+    return best || newRoom(false, 2);
+  }
+  function join2(list) {
+    const room = lobby2(list.length);
+    if (!room) { for (const p of list) send(p, { t: 'err', code: 'full' }); return; }
+    if (list.length === 2) {
+      const t = room.size - teamCount(room, 0) === 2 ? 0 : 1, base = t * room.size;
+      seat(room, list[0], base); seat(room, list[1], base + 1);
+    } else {
+      const t = teamCount(room, 0) <= teamCount(room, 1) ? 0 : 1;                       // keep the teams even
+      let idx = -1;
+      for (let i = 0; i < room.seats.length; i++) if (!room.seats[i] && teamOfSeat(room, i) === t) { idx = i; break; }
+      if (idx < 0) idx = room.seats.indexOf(null);
+      seat(room, list[0], idx);
+    }
+  }
+  const findOnline = lower => { for (const q of byUid.values()) if (q.authed && !q.watcher && q.ws.readyState === 1 && q.name.toLowerCase() === lower) return q; return null; };
+  function dropInvite(inv, why) {
+    if (!invites.has(inv.id)) return;
+    invites.delete(inv.id);
+    if (inv.to.invite === inv) inv.to.invite = null;
+    if (inv.from.outgoing === inv) inv.from.outgoing = null;
+    if (why) { send(inv.from, { t: 'invite_no', name: inv.to.name, why }); send(inv.to, { t: 'invite_gone', id: inv.id }); }
+  }
+  function onInvite(p, msg) {
+    const now = Date.now();
+    p.invAt = (p.invAt || []).filter(x => now - x < 60000);
+    if (p.invAt.length >= 12 || now - (p.invAt[p.invAt.length - 1] || 0) < 1500) return send(p, { t: 'invite_err', code: 'slow' });
+    p.invAt.push(now);
+    const name = typeof msg.name === 'string' ? msg.name.trim().slice(0, 20) : '';
+    if (!USER_RE.test(name)) return send(p, { t: 'invite_err', code: 'name' });
+    if (p.room) return send(p, { t: 'invite_err', code: 'busy_me' });
+    const q = findOnline(name.toLowerCase());
+    if (!q) return send(p, { t: 'invite_err', code: 'offline', name });                // only sent to people on RockLeague right now
+    if (q === p || q.uid === p.uid) return send(p, { t: 'invite_err', code: 'self' });
+    if (q.room) return send(p, { t: 'invite_err', code: 'busy', name: q.name });
+    if (q.invite && invites.has(q.invite.id)) return send(p, { t: 'invite_err', code: 'pending', name: q.name });
+    if (p.outgoing) dropInvite(p.outgoing, 'replaced');
+    const inv = { id: require('crypto').randomBytes(9).toString('base64url'), from: p, to: q, exp: now + INVITE_MS };
+    invites.set(inv.id, inv); q.invite = inv; p.outgoing = inv;
+    send(q, { t: 'invite', id: inv.id, from: p.name, ms: INVITE_MS });
+    send(p, { t: 'invited', name: q.name, ms: INVITE_MS });
+  }
+  function onInviteReply(p, msg) {
+    const inv = typeof msg.id === 'string' ? invites.get(msg.id) : null;
+    if (!inv || inv.to !== p) return send(p, { t: 'invite_gone', id: msg.id });
+    if (Date.now() > inv.exp + 400) { dropInvite(inv, 'timeout'); return; }
+    if (!msg.yes) { dropInvite(inv, 'no'); return; }
+    const a = inv.from;
+    if (a.ws.readyState !== 1 || !players.has(a) || a.room || p.room) { dropInvite(inv, 'busy'); return; }
+    dropInvite(inv, '');
+    unqueue(a); unqueue(p);
+    a.mate = p; p.mate = a;
+    send(a, { t: 'party', mate: p.name }); send(p, { t: 'party', mate: a.name });
+    join2([a, p]);                                                                     // straight into the 2v2 queue, on the same team
+  }
+  setInterval(safe(() => {                                                             // invites that ran out of time
+    const now = Date.now();
+    for (const inv of [...invites.values()]) if (now > inv.exp + 400) dropInvite(inv, 'timeout');
+  }, 'invites'), 500);
   async function onHello(p, msg) {
     if (msg.v !== RL_PROTO) { send(p, { t: 'err', code: 'version' }); setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 300); return; }
     let who; try { who = await verifyToken(msg.token); } catch (_) { send(p, { t: 'err', code: 'auth' }); setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 300); return; }
@@ -333,6 +431,14 @@ module.exports = function createRockLeague(ctx) {
         break;
       }
       case 'cancel': unqueue(p); send(p, { t: 'unqueued' }); break;
+      case 'quick2': {                                    // 2v2 quick play on your own: you'll get a random teammate
+        if (p.room) return;
+        unqueue(p);
+        join2([p]);
+        break;
+      }
+      case 'invite': onInvite(p, msg); break;
+      case 'invite_reply': onInviteReply(p, msg); break;
       case 'create': {
         if (p.room) return;
         unqueue(p);
@@ -357,7 +463,7 @@ module.exports = function createRockLeague(ctx) {
         const room = p.room; if (!room || room.phase !== 'over') return;
         room.rematch.add(p.cid);
         broadcast(room, { t: 'rematch', ids: [...room.rematch] });
-        if (seated(room).length === 2 && seated(room).every(o => room.rematch.has(o.cid))) startMatch(room);
+        if (room.seats.every(Boolean) && seated(room).every(o => room.rematch.has(o.cid))) startMatch(room);
         break;
       }
       case 'leave': if (p.room) leaveRoom(p, 'left'); unqueue(p); send(p, { t: 'menu' }); break;
@@ -415,6 +521,7 @@ module.exports = function createRockLeague(ctx) {
     ws.on('message', safe(raw => onMessage(p, raw), 'message'));
     ws.on('close', safe(() => {
       clearTimeout(helloTimer); players.delete(p); unqueue(p);
+      if (p.invite) dropInvite(p.invite, 'busy'); if (p.outgoing) dropInvite(p.outgoing, '');
       if (p.watcher) { if (p.watchRoom) p.watchRoom.watchers.delete(p); return; }
       if (p.room) leaveRoom(p, 'disconnected');
       if (byUid.get(p.uid) === p) byUid.delete(p.uid);
