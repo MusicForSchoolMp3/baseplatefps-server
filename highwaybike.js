@@ -137,6 +137,7 @@ module.exports = function createHB(ctx) {
   async function onHello(p, msg) {
     if (msg.v !== HB_PROTO || msg.sim !== H.VERSION) { send(p, { t: 'err', code: 'version', game: 'highwaybike' }); close(p); return; }
     let who; try { who = await verifyToken(msg.token); } catch (_) { send(p, { t: 'err', code: 'auth' }); close(p); return; }
+    if (ctx.alts) ctx.alts.seen(p.dev, who);                            // this account, this browser (for the owner's banned-before dot)
     const prof = await loadProfile(who);
     if (p.ws.readyState !== 1) return;
     if (prof.banned) { send(p, { t: 'err', code: 'banned' }); close(p, 400); return; }
@@ -208,8 +209,9 @@ module.exports = function createHB(ctx) {
       case 'look': if (now - (p.lookAt || 0) > 500) { p.lookAt = now; p.look = cleanLook(msg.look); roster(); } break;
     }
   }
-  wss.on('connection', ws => {
-    const p = { ws, cid: 'h' + (nextId++), uid: '', name: '', authed: false, hw: null, st: null, look: cleanLook(null), known: new Map(), watcher: false, watch: null, msgs: 0, msgWindow: Date.now() };
+  if (ctx.alts) wss.on('headers', (h, req) => ctx.alts.headers(h, req));
+  wss.on('connection', (ws, req) => {
+    const p = { ws, dev: ctx.alts ? ctx.alts.devOf(req) : '', cid: 'h' + (nextId++), uid: '', name: '', authed: false, hw: null, st: null, look: cleanLook(null), known: new Map(), watcher: false, watch: null, msgs: 0, msgWindow: Date.now() };
     players.add(p);
     const helloTimer = setTimeout(() => { if (!p.authed) try { ws.close(); } catch (_) {} }, 15000);
     ws.on('pong', () => { ws._hbMissed = false; });

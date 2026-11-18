@@ -201,6 +201,7 @@ module.exports = function createSurf(ctx) {
   async function onHello(p, msg) {
     if (msg.v !== SURF_PROTO || msg.phys !== S.VERSION) { send(p, { t: 'err', code: 'version', game: 'swellsurf' }); setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 300); return; }
     let who; try { who = await verifyToken(msg.token); } catch (_) { send(p, { t: 'err', code: 'auth' }); setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 300); return; }
+    if (ctx.alts) ctx.alts.seen(p.dev, who);                            // this account, this browser (for the owner's banned-before dot)
     const prof = await loadProfile(who);
     if (p.ws.readyState !== 1) return;
     if (prof.banned) { send(p, { t: 'err', code: 'banned' }); setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 400); return; }
@@ -284,8 +285,9 @@ module.exports = function createSurf(ctx) {
       }
     }
   }
-  wss.on('connection', ws => {
-    const p = { ws, cid: 's' + (nextId++), uid: '', name: '', authed: false, room: null, solo: null, st: null, look: cleanLook(null), msgs: 0, msgWindow: Date.now() };
+  if (ctx.alts) wss.on('headers', (h, req) => ctx.alts.headers(h, req));
+  wss.on('connection', (ws, req) => {
+    const p = { ws, dev: ctx.alts ? ctx.alts.devOf(req) : '', cid: 's' + (nextId++), uid: '', name: '', authed: false, room: null, solo: null, st: null, look: cleanLook(null), msgs: 0, msgWindow: Date.now() };
     players.add(p);
     const helloTimer = setTimeout(() => { if (!p.authed) try { ws.close(); } catch (_) {} }, 15000);
     ws.on('pong', () => { ws._surfMissed = false; });

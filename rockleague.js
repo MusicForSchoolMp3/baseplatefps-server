@@ -367,6 +367,7 @@ module.exports = function createRockLeague(ctx) {
   async function onHello(p, msg) {
     if (msg.v !== RL_PROTO) { send(p, { t: 'err', code: 'version' }); setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 300); return; }
     let who; try { who = await verifyToken(msg.token); } catch (_) { send(p, { t: 'err', code: 'auth' }); setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 300); return; }
+    if (ctx.alts) ctx.alts.seen(p.dev, who);                            // this account, this browser (for the owner's banned-before dot)
     const prof = await loadProfile(who);
     if (p.ws.readyState !== 1) return;
     if (prof.banned) { send(p, { t: 'err', code: 'banned' }); setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 400); return; }
@@ -512,8 +513,9 @@ module.exports = function createRockLeague(ctx) {
     }
   }
 
-  wss.on('connection', ws => {
-    const p = { ws, cid: 'c' + (nextId++), uid: '', name: '', authed: false, room: null, team: -1, car: { body: 'breaker', accent: ACCENTS[0] },
+  if (ctx.alts) wss.on('headers', (h, req) => ctx.alts.headers(h, req));
+  wss.on('connection', (ws, req) => {
+    const p = { ws, dev: ctx.alts ? ctx.alts.devOf(req) : '', cid: 'c' + (nextId++), uid: '', name: '', authed: false, room: null, team: -1, car: { body: 'breaker', accent: ACCENTS[0] },
       q: [], lastSeq: -1, ack: -1, last: P.IDLE, starve: 0, msgs: 0, msgWindow: Date.now() };
     players.add(p);
     const helloTimer = setTimeout(() => { if (!p.authed) try { ws.close(); } catch (_) {} }, 15000);

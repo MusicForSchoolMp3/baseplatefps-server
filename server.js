@@ -446,6 +446,7 @@ async function onHello(p, msg) {
   let who;
   try { who = await verifyToken(msg.token); }
   catch (e) { send(p, { t: 'err', code: 'auth' }); p.ws.close(); return; }
+  ALTS.seen(p.dev, who);                                          // this account, this browser (before the ban check, so banned ones are noted too)
   if (p.ws.readyState !== 1) return;
   const prof = await loadProfile(who, msg.cos, msg.skins);
   if (p.ws.readyState !== 1) return;
@@ -665,6 +666,8 @@ function onVote(p, msg) {
    signed-in email is an owner's. Nothing a browser sends can fake that, so nobody else can ban anyone. */
 const adminLog = [];                                            // recent requests, for a simple rate limit
 const knownNames = new Map();                                   // lower-case username -> uid, for everyone seen since the server started
+// banned-before detector: which accounts have been on the same browser (alts.js; owner panel only, never sent to players)
+const ALTS = require('./alts.js')({ getDb: () => db, admin, modRec, secret: process.env.DEVICE_SECRET || process.env.FIREBASE_SERVICE_ACCOUNT || '', EMAIL_DOMAIN, isOwner: n => COS.isOwner(n) });
 function adminSend(res, code, obj) {
   res.writeHead(code, { 'content-type': 'application/json', 'access-control-allow-origin': '*', 'cache-control': 'no-store' });
   res.end(JSON.stringify(obj));
@@ -716,18 +719,23 @@ async function onAdmin(req, res) {
   adminLog.push(now);
   if (req.method === 'GET' && req.url === '/admin/players') {
     const list = [];
-    for (const p of byUid.values()) if (p.room && !p.watcher) list.push({ name: p.name, game: 'baseplate-fps', room: 'Baseplate FPS ' + (p.room.isPublic ? 'public match' : 'match ' + p.room.code), kills: p.kills, owner: COS.isOwner(p.name) });
+    for (const p of byUid.values()) if (p.room && !p.watcher) list.push({ name: p.name, uid: p.uid, game: 'baseplate-fps', room: 'Baseplate FPS ' + (p.room.isPublic ? 'public match' : 'match ' + p.room.code), kills: p.kills, owner: COS.isOwner(p.name) });
     for (const r of rlCall(x => x.list(), [])) list.push(Object.assign(r, { game: 'rockleague', owner: COS.isOwner(r.name) }));
     for (const r of ocbCall(x => x.list(), [])) list.push(Object.assign(r, { game: 'othercolourbike', owner: COS.isOwner(r.name) }));
     for (const r of surfCall(x => x.list(), [])) list.push(Object.assign(r, { game: 'swellsurf', owner: COS.isOwner(r.name) }));
     for (const r of hbCall(x => x.list(), [])) list.push(Object.assign(r, { game: 'highwaybike', owner: COS.isOwner(r.name) }));
+    for (const pl of list) {                                        // the banned-before dot: worked out here, only ever sent to the owner
+      const uid = pl.uid || knownNames.get(String(pl.name).toLowerCase()) || '';
+      pl.alts = pl.owner ? [] : ALTS.bannedAltsOf(uid);
+      delete pl.uid;
+    }
     return adminSend(res, 200, { players: list.sort((a, b) => a.name.localeCompare(b.name)) });
   }
   if (req.method === 'GET' && req.url === '/admin/panel.js') {     // the owner panel itself is only ever sent to the owner
     res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'access-control-allow-origin': '*', 'cache-control': 'no-store' });
     res.end(ADMIN_PANEL); return;
   }
-  if (req.method === 'GET' && req.url === '/admin/flags') return adminSend(res, 200, { flags: AC ? AC.list() : [] });
+  if (req.method === 'GET' && req.url === '/admin/flags') return adminSend(res, 200, { flags: (AC ? AC.list() : []).map(f => { ALTS.warm(f.uid); return Object.assign({}, f, { alts: ALTS.bannedAltsOf(f.uid) }); }) });
   if (req.method === 'GET' && req.url.startsWith('/admin/flag?id=')) {
     const f = AC && AC.get(decodeURIComponent(req.url.slice(15)).slice(0, 40));
     return f ? adminSend(res, 200, { flag: f }) : adminSend(res, 404, { error: 'That flag is gone.' });
@@ -753,6 +761,7 @@ async function onAdmin(req, res) {
   if (!acct) return adminSend(res, 404, { error: `No account called ${name}.` });
   if (req.url === '/admin/ban') return adminSend(res, 200, await banAccount(acct, me));
   modRec.set(acct.uid, { banned: false, tamperAt: 0 });
+  ALTS.noteUnban(acct.uid);
   if (db) await db.ref('users/' + acct.uid + '/mod').remove().catch(e => console.warn('unban write failed', e.message));
   console.log(`${me.name} unbanned ${acct.name}`);
   return adminSend(res, 200, { ok: true, name: acct.name, msg: `${acct.name} is unbanned.` });
@@ -761,6 +770,7 @@ async function onAdmin(req, res) {
 async function banAccount(acct, me) {
   {
     modRec.set(acct.uid, { banned: true, tamperAt: Date.now() });
+    ALTS.noteBan(acct.uid, acct.name, me.name);                                                            // remembered for good, for the banned-before dot
     if (db) await db.ref('users/' + acct.uid + '/mod').update({ banned: true, bannedAt: admin.database.ServerValue.TIMESTAMP, bannedBy: me.name }).catch(e => console.warn('ban write failed', e.message));
     const p = byUid.get(acct.uid);
     if (p) { send(p, { t: 'err', code: 'banned' }); if (p.room) leaveRoom(p, 'banned'); setTimeout(() => { try { p.ws.close(); } catch (_) {} }, 300); }
@@ -787,22 +797,22 @@ try {
 } catch (e) { console.error('Anti-cheat failed to start (the games are unaffected):', e && e.message); }
 let RL = null;
 try {
-  RL = require('./rockleague.js')({ admin, getDb: () => db, verifyToken, modRec, knownNames, USER_RE, EMAIL_DOMAIN, DEV_TOKENS, isOwner: n => COS.isOwner(n), isOwnerWho });
+  RL = require('./rockleague.js')({ alts: ALTS, admin, getDb: () => db, verifyToken, modRec, knownNames, USER_RE, EMAIL_DOMAIN, DEV_TOKENS, isOwner: n => COS.isOwner(n), isOwnerWho });
   console.log('RockLeague is running on /rl');
 } catch (e) { console.error('RockLeague failed to start (Baseplate FPS is unaffected):', e && e.message); }
 let OCB = null;                                                   // othercolourbike: same idea, its own file, can't break the others
 try {
-  OCB = require('./othercolourbike.js')({ admin, getDb: () => db, verifyToken, modRec, knownNames, USER_RE, EMAIL_DOMAIN, DEV_TOKENS, isOwnerWho });
+  OCB = require('./othercolourbike.js')({ alts: ALTS, admin, getDb: () => db, verifyToken, modRec, knownNames, USER_RE, EMAIL_DOMAIN, DEV_TOKENS, isOwnerWho });
   console.log('othercolourbike is running on /ocb');
 } catch (e) { console.error('othercolourbike failed to start (the other games are unaffected):', e && e.message); }
 let SURF = null;                                                  // SwellSurf: same idea again, its own file, can't break the others
 try {
-  SURF = require('./swellsurf.js')({ admin, getDb: () => db, verifyToken, modRec, knownNames, USER_RE, EMAIL_DOMAIN, DEV_TOKENS, isOwnerWho });
+  SURF = require('./swellsurf.js')({ alts: ALTS, admin, getDb: () => db, verifyToken, modRec, knownNames, USER_RE, EMAIL_DOMAIN, DEV_TOKENS, isOwnerWho });
   console.log('SwellSurf is running on /surf');
 } catch (e) { console.error('SwellSurf failed to start (the other games are unaffected):', e && e.message); }
 let HB = null;                                                    // Highway Bike: its own file again, can't break the others
 try {
-  HB = require('./highwaybike.js')({ admin, getDb: () => db, verifyToken, modRec, knownNames, USER_RE, EMAIL_DOMAIN, DEV_TOKENS, isOwnerWho });
+  HB = require('./highwaybike.js')({ alts: ALTS, admin, getDb: () => db, verifyToken, modRec, knownNames, USER_RE, EMAIL_DOMAIN, DEV_TOKENS, isOwnerWho });
   console.log('Highway Bike is running on /hb');
 } catch (e) { console.error('Highway Bike failed to start (the other games are unaffected):', e && e.message); }
 const hbCall = (fn, dflt) => { try { return HB ? fn(HB) : dflt; } catch (e) { console.error('[highwaybike]', e && e.message); return dflt; } };
@@ -850,6 +860,7 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 });
 server.on('upgrade', (req, socket, head) => {
   socket.on('error', () => {});
+  ALTS.tag(req);                                                    // the browser's device ID (read or handed out) for whichever game this is
   const path = String(req.url || '/').split('?')[0];
   if (path === '/rl') { if (RL) RL.handleUpgrade(req, socket, head); else socket.destroy(); return; }   // RockLeague
   if (path === '/ocb') { if (OCB) OCB.handleUpgrade(req, socket, head); else socket.destroy(); return; } // othercolourbike
@@ -858,8 +869,9 @@ server.on('upgrade', (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));                         // Baseplate FPS (every other path, as before)
 });
 
-wss.on('connection', ws => {
-  const p = { id: nextId++, ws, uid: '', name: '', authed: false, room: null, loadout: WEAPON_LIST.slice(), cos: '',
+wss.on('headers', (h, req) => ALTS.headers(h, req));
+wss.on('connection', (ws, req) => {
+  const p = { id: nextId++, ws, dev: ALTS.devOf(req), uid: '', name: '', authed: false, room: null, loadout: WEAPON_LIST.slice(), cos: '',
     s: { p: [0, 0, 0], v: [0, 0, 0], yw: 0, pt: 0, g: true, sp: false, ad: false, rl: false, w: 'rifle' },
     hp: 100, alive: true, part: 0, team: -1, kills: 0, deaths: 0, shots: 0, se: [0, 0, 0], lastShot: 0, wSince: 0, zoneAcc: 0,
     respawnAt: 0, protectUntil: 0, lastHurtBy: null, lastHurtAt: 0, voteMode: '', voteMap: '',

@@ -22,7 +22,12 @@
 #ownerPanel .op-list{overflow:auto;display:grid;gap:6px}
 #ownerPanel .op-p{display:grid;grid-template-columns:1fr auto auto;gap:6px;align-items:center;padding:8px 10px;border:1px solid rgba(255,255,255,.1);border-radius:6px}
 #ownerPanel .op-p small{display:block;color:#93a0aa;font-size:12px}
-#ownerPanel .op-head{display:flex;justify-content:space-between;align-items:center}`;
+#ownerPanel .op-head{display:flex;justify-content:space-between;align-items:center}
+#ownerPanel .op-dot,#acBox .op-dot{display:inline-flex;align-items:center;gap:5px;margin-left:7px;padding:1px 7px 1px 5px;border:1px solid rgba(255,80,70,.6);border-radius:999px;background:rgba(255,60,50,.12);color:#ff8a80;font:700 11px system-ui,sans-serif;cursor:pointer;vertical-align:1px}
+#ownerPanel .op-dot i,#acBox .op-dot i{width:8px;height:8px;border-radius:50%;background:#ff3b30;box-shadow:0 0 6px #ff3b30}
+#ownerPanel .op-alts,#acBox .op-alts{grid-column:1/-1;margin:2px 0 0;padding:7px 9px;border-radius:6px;background:rgba(255,60,50,.08);border:1px solid rgba(255,80,70,.25);font-size:12px;color:#e7c9c6}
+#ownerPanel .op-alts b,#acBox .op-alts b{color:#fff}
+#ownerPanel .op-alts ul,#acBox .op-alts ul{margin:4px 0 0;padding-left:16px}`;
   document.head.appendChild(css);
   const btn = document.createElement('button'); btn.id = 'ownerBtn'; btn.type = 'button'; btn.textContent = 'Owner panel';
   const box = document.createElement('div'); box.id = 'ownerPanel'; box.hidden = true;
@@ -57,6 +62,22 @@
     const g = GAMES[pl.game]; if (!g) { status("Can't watch that game.", 'bad'); return; }
     window.open(new URL(g[1] + '?watch=' + encodeURIComponent(pl.name), location.href).href, '_blank', 'noopener');
   }
+  /* the banned-before dot: the server works out which banned accounts have been on the same browser as this one */
+  const altOpen = new Set();
+  const day = t => t ? new Date(t).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' }) : 'before this was tracked';
+  function altDot(key, name, alts, after) {
+    if (!alts || !alts.length) return null;
+    const dot = document.createElement('span'); dot.className = 'op-dot'; dot.title = 'Banned before (only you can see this)';
+    dot.innerHTML = '<i></i>' + alts.length + (alts.length === 1 ? ' banned account' : ' banned accounts') + ' ' + (altOpen.has(key) ? '▴' : '▾');
+    const box = document.createElement('div'); box.className = 'op-alts'; box.hidden = !altOpen.has(key);
+    const head = document.createElement('div'); head.innerHTML = '<b></b> has been on the same device as accounts you banned:'; head.querySelector('b').textContent = name;
+    const ul = document.createElement('ul');
+    for (const a of alts) { const li = document.createElement('li'); li.textContent = a.name + ' · banned ' + day(a.at) + (a.unbanned ? ' (unbanned since)' : ''); ul.append(li); }
+    box.append(head, ul);
+    dot.onclick = e => { e.stopPropagation(); if (altOpen.has(key)) altOpen.delete(key); else altOpen.add(key); box.hidden = !altOpen.has(key); dot.innerHTML = dot.innerHTML.replace(/[▴▾]$/, altOpen.has(key) ? '▴' : '▾'); };
+    after(box);
+    return dot;
+  }
   async function refresh() {
     const list = $('opList');
     try {
@@ -67,9 +88,11 @@
         const row = document.createElement('div'); row.className = 'op-p';
         const who = document.createElement('div'); const n = document.createElement('strong'); n.textContent = pl.name;
         const d = document.createElement('small'); d.textContent = (pl.room || (GAMES[pl.game] || [''])[0]) + (pl.kills ? ' · ' + pl.kills + ' kills' : '');
-        who.append(n, d); row.append(who);
+        let altBox = null; const dot = altDot('p:' + pl.name, pl.name, pl.alts, b => { altBox = b; });
+        who.append(n); if (dot) who.append(dot); who.append(d); row.append(who);
         const w = document.createElement('button'); w.type = 'button'; w.textContent = 'Watch'; w.onclick = () => watch(pl); row.append(w);
         if (!pl.owner) { const b = document.createElement('button'); b.type = 'button'; b.className = 'ban'; b.textContent = 'Ban'; b.onclick = () => arm(b, 'Ban', () => act('ban', pl.name)); row.append(b); } else row.append(document.createElement('span'));
+        if (altBox) row.append(altBox);
         return row;
       }));
     } catch (e) { list.innerHTML = ''; status(e.message, 'bad'); }
@@ -113,19 +136,26 @@
   const esc = x => String(x).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   async function acRefresh() {
     let list; try { list = (await call('/admin/flags')).flags || []; } catch (_) { return; }
-    const sig = JSON.stringify(list.map(f => [f.id, f.count, acMin]));
+    const sig = JSON.stringify(list.map(f => [f.id, f.count, acMin, (f.alts || []).map(a => a.name + a.unbanned)]));
     if (sig === acSeen) return; acSeen = sig;
     acBox.hidden = !list.length;
     if (!list.length) { acBox.innerHTML = ''; return; }
     acBox.innerHTML = `<div class="ac-h"><span>⚠ Anti-cheat · ${list.length} to check <small>(only you can see this)</small></span><button class="ac-min" data-min>${acMin ? 'Show' : 'Hide'}</button></div>` + (acMin ? '' : list.map(f => `
 <div class="ac-f" data-id="${esc(f.id)}">
-  <div class="ac-t"><div><b>${esc(f.name)}</b> · ${esc(f.title)}${f.count > 1 ? ` <span>×${f.count}</span>` : ''}</div><span>${esc(when(f.at))}${f.count > 1 ? ' · last ' + esc(when(f.lastAt)) : ''}</span></div>
+  <div class="ac-t"><div><b>${esc(f.name)}</b>${f.alts && f.alts.length ? `<span class="op-dot" data-alts title="Banned before (only you can see this)"><i></i>${f.alts.length} banned ${f.alts.length === 1 ? 'account' : 'accounts'} ${altOpen.has('f:' + f.uid) ? '▴' : '▾'}</span>` : ''} · ${esc(f.title)}${f.count > 1 ? ` <span>×${f.count}</span>` : ''}</div><span>${esc(when(f.at))}${f.count > 1 ? ' · last ' + esc(when(f.lastAt)) : ''}</span></div>
+  ${f.alts && f.alts.length ? `<div class="op-alts" data-altbox="${esc(f.uid)}"${altOpen.has('f:' + f.uid) ? '' : ' hidden'}><b>${esc(f.name)}</b> has been on the same device as accounts you banned:<ul>${f.alts.map(a => `<li>${esc(a.name)} · banned ${esc(day(a.at))}${a.unbanned ? ' (unbanned since)' : ''}</li>`).join('')}</ul></div>` : ''}
   <div class="ac-d">${esc(f.desc)}${f.room ? ` <span style="color:#7d8891">(${esc(f.room)}${f.map ? ', ' + esc(f.map) : ''})</span>` : ''}</div>
   <div class="ac-b">${f.hasReplay ? '<button data-act="replay">▶ Replay last 10 s</button>' : ''}<button class="ap" data-act="approve">Approve (ban)</button><button class="rj" data-act="reject">Reject</button></div>
 </div>`).join(''));
   }
   acBox.addEventListener('click', async e => {
     if (e.target.closest('[data-min]')) { acMin = !acMin; acSeen = ''; acRefresh(); return; }
+    const dot = e.target.closest('[data-alts]');
+    if (dot) {                                                     // show / hide the banned accounts under this flag
+      const card = dot.closest('.ac-f'), box = card && card.querySelector('[data-altbox]'); if (!box) return;
+      const key = 'f:' + box.dataset.altbox; if (altOpen.has(key)) altOpen.delete(key); else altOpen.add(key);
+      box.hidden = !altOpen.has(key); dot.innerHTML = dot.innerHTML.replace(/[▴▾]$/, altOpen.has(key) ? '▴' : '▾'); return;
+    }
     const b = e.target.closest('[data-act]'); if (!b) return;
     const id = b.closest('[data-id]').dataset.id, act = b.dataset.act;
     if (act === 'replay') { openReplay(id); return; }
