@@ -667,6 +667,20 @@ function onVote(p, msg) {
 const adminLog = [];                                            // recent requests, for a simple rate limit
 const knownNames = new Map();                                   // lower-case username -> uid, for everyone seen since the server started
 // banned-before detector: which accounts have been on the same browser (alts.js; owner panel only, never sent to players)
+// owner messages and jumpscares: every page on the site keeps a small connection at /notify (notify.js); only the owner can push
+const NOTIFY = require('./notify.js')({ verifyToken: (...a) => verifyToken(...a), EMAIL_DOMAIN, isOwnerWho: w => isOwnerWho(w) });
+let notifyLast = 0;
+const IMG_MAX = 1200 * 1024;                                       // biggest picture the owner panel can send (it shrinks photos before sending)
+function checkImage(src) {                                         // a real png / jpeg / webp / gif, nothing else (no svg, no scripts)
+  const m = /^data:image\/(png|jpeg|webp|gif);base64,([A-Za-z0-9+/]+={0,2})$/.exec(String(src || ''));
+  if (!m) return null;
+  const buf = Buffer.from(m[2], 'base64');
+  if (!buf.length || buf.length > IMG_MAX) return null;
+  const sig = { png: [0x89, 0x50, 0x4e, 0x47], jpeg: [0xff, 0xd8, 0xff], gif: [0x47, 0x49, 0x46, 0x38], webp: [0x52, 0x49, 0x46, 0x46] }[m[1]];
+  if (!sig.every((b, i) => buf[i] === b)) return null;
+  if (m[1] === 'webp' && buf.slice(8, 12).toString('latin1') !== 'WEBP') return null;
+  return 'data:image/' + m[1] + ';base64,' + buf.toString('base64');
+}
 const ALTS = require('./alts.js')({ getDb: () => db, admin, modRec, secret: process.env.DEVICE_SECRET || process.env.FIREBASE_SERVICE_ACCOUNT || '', EMAIL_DOMAIN, isOwner: n => COS.isOwner(n) });
 function adminSend(res, code, obj) {
   res.writeHead(code, { 'content-type': 'application/json', 'access-control-allow-origin': '*', 'cache-control': 'no-store' });
@@ -730,6 +744,28 @@ async function onAdmin(req, res) {
       delete pl.uid;
     }
     return adminSend(res, 200, { players: list.sort((a, b) => a.name.localeCompare(b.name)) });
+  }
+  if (req.method === 'GET' && req.url === '/admin/online') return adminSend(res, 200, { online: NOTIFY.online() });   // everyone with the site open
+  if (req.method === 'POST' && req.url === '/admin/notify') {      // a message or a jumpscare, straight onto their screen
+    let body; try { body = await readBody(req, IMG_MAX * 1.4 + 4096); } catch (_) { return adminSend(res, 413, { error: "That picture's too big." }); }
+    if (now - notifyLast < 1200) return adminSend(res, 429, { error: 'One at a time.' });
+    const to = body.to === '*' ? '*' : String(body.to || '').trim().toLowerCase();
+    if (to !== '*' && !USER_RE.test(to)) return adminSend(res, 400, { error: 'Pick who to send it to.' });
+    let payload;
+    if (body.kind === 'msg') {
+      const text = String(body.text || '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 240);
+      if (!text) return adminSend(res, 400, { error: 'Type a message.' });
+      payload = { t: 'msg', text, secs: 3.5 };
+    } else if (body.kind === 'img') {
+      const src = checkImage(body.img);
+      if (!src) return adminSend(res, 400, { error: 'That picture can\'t be sent (png, jpg, webp or gif, up to 1.2 MB).' });
+      payload = { t: 'img', src, secs: 3 };
+    } else return adminSend(res, 400, { error: 'Bad request.' });
+    notifyLast = now;
+    const n = NOTIFY.push(to, payload);
+    console.log(`${me.name} sent a ${body.kind === 'img' ? 'jumpscare' : 'message'} to ${to === '*' ? 'everyone' : to} (${n} reached)`);
+    if (!n) return adminSend(res, 200, { ok: true, n, msg: to === '*' ? 'Nobody else has the site open right now.' : to + " doesn't have the site open right now." });
+    return adminSend(res, 200, { ok: true, n, msg: (body.kind === 'img' ? 'Jumpscare' : 'Message') + ' sent to ' + (to === '*' ? n + (n === 1 ? ' player' : ' players') : to) + '.' });
   }
   if (req.method === 'GET' && req.url === '/admin/panel.js') {     // the owner panel itself is only ever sent to the owner
     res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'access-control-allow-origin': '*', 'cache-control': 'no-store' });
@@ -862,6 +898,7 @@ server.on('upgrade', (req, socket, head) => {
   socket.on('error', () => {});
   ALTS.tag(req);                                                    // the browser's device ID (read or handed out) for whichever game this is
   const path = String(req.url || '/').split('?')[0];
+  if (path === '/notify') { NOTIFY.handleUpgrade(req, socket, head); return; }                     // owner messages / jumpscares (every page)
   if (path === '/rl') { if (RL) RL.handleUpgrade(req, socket, head); else socket.destroy(); return; }   // RockLeague
   if (path === '/ocb') { if (OCB) OCB.handleUpgrade(req, socket, head); else socket.destroy(); return; } // othercolourbike
   if (path === '/surf') { if (SURF) SURF.handleUpgrade(req, socket, head); else socket.destroy(); return; } // SwellSurf

@@ -23,6 +23,11 @@
 #ownerPanel .op-p{display:grid;grid-template-columns:1fr auto auto;gap:6px;align-items:center;padding:8px 10px;border:1px solid rgba(255,255,255,.1);border-radius:6px}
 #ownerPanel .op-p small{display:block;color:#93a0aa;font-size:12px}
 #ownerPanel .op-head{display:flex;justify-content:space-between;align-items:center}
+#ownerPanel .op-send{display:grid;gap:6px;padding:10px;border:1px solid rgba(255,255,255,.1);border-radius:8px;background:rgba(255,255,255,.025)}
+#ownerPanel select{flex:1;min-width:0;padding:8px 9px;border-radius:6px;border:1px solid rgba(255,255,255,.18);background:#0a0c10;color:#fff;font:600 14px system-ui,sans-serif}
+#ownerPanel .op-file{display:inline-flex;align-items:center;padding:8px 12px;border-radius:6px;border:1px dashed rgba(255,255,255,.3);color:#dfe5ea;font:700 13px system-ui,sans-serif;cursor:pointer;white-space:nowrap}
+#ownerPanel .op-prev{width:64px;height:40px;object-fit:cover;border-radius:5px;border:1px solid rgba(255,255,255,.2);background:#000}
+#ownerPanel .op-pic{align-items:center}#ownerPanel .op-pic small{flex:1;color:#93a0aa;font-size:12px}
 #ownerPanel .op-dot,#acBox .op-dot{display:inline-flex;align-items:center;gap:5px;margin-left:7px;padding:1px 7px 1px 5px;border:1px solid rgba(255,80,70,.6);border-radius:999px;background:rgba(255,60,50,.12);color:#ff8a80;font:700 11px system-ui,sans-serif;cursor:pointer;vertical-align:1px}
 #ownerPanel .op-dot i,#acBox .op-dot i{width:8px;height:8px;border-radius:50%;background:#ff3b30;box-shadow:0 0 6px #ff3b30}
 #ownerPanel .op-alts,#acBox .op-alts{grid-column:1/-1;margin:2px 0 0;padding:7px 9px;border-radius:6px;background:rgba(255,60,50,.08);border:1px solid rgba(255,80,70,.25);font-size:12px;color:#e7c9c6}
@@ -34,6 +39,12 @@
   box.innerHTML = `<div class="op-head"><h2>Owner panel</h2><button type="button" data-x>Close</button></div>
 <div class="op-row"><input id="opName" maxlength="20" placeholder="Username" autocomplete="off" spellcheck="false"><button type="button" class="ban" id="opBan">Ban</button><button type="button" id="opUnban">Unban</button></div>
 <div class="op-status" id="opStatus" role="status"></div>
+<div class="op-send">
+  <div class="op-head"><strong>Message or jumpscare</strong><small style="color:#7d8891;font-size:12px">shows on their screen, any game</small></div>
+  <div class="op-row"><select id="opTo" aria-label="Send to"><option value="*">Everyone online</option></select></div>
+  <div class="op-row"><input id="opMsg" maxlength="240" placeholder="Message (on screen for 3-4 s)" autocomplete="off"><button type="button" id="opSendMsg">Send</button></div>
+  <div class="op-row op-pic"><label class="op-file">Pick picture<input type="file" id="opPic" accept="image/png,image/jpeg,image/webp,image/gif" hidden></label><img class="op-prev" id="opPrev" alt="" hidden><small id="opPicInfo">full screen for 3 s</small><button type="button" class="ban" id="opSendPic" disabled>Jumpscare</button></div>
+</div>
 <div class="op-head"><strong>Playing right now <span id="opN"></span></strong><button type="button" id="opRefresh">Refresh</button></div>
 <div class="op-list" id="opList"></div>
 <p style="margin:0;font-size:12px;color:#7d8891">Watch opens their game in a new tab. Nobody can see you watching: you aren't in their match, lists or player counts. Bans kick them out of every game at once.</p>`;
@@ -98,11 +109,62 @@
     } catch (e) { list.innerHTML = ''; status(e.message, 'bad'); }
   }
   let timer = 0;
-  btn.onclick = () => { box.hidden = !box.hidden; clearInterval(timer); if (!box.hidden) { refresh(); timer = setInterval(refresh, 6000); } };
+  btn.onclick = () => { box.hidden = !box.hidden; clearInterval(timer); if (!box.hidden) { refresh(); refreshOnline(); timer = setInterval(() => { refresh(); refreshOnline(); }, 6000); } };
   box.querySelector('[data-x]').onclick = () => { box.hidden = true; clearInterval(timer); };
   $('opBan').onclick = e => arm(e.currentTarget, 'Ban', () => act('ban', $('opName').value));
   $('opUnban').onclick = () => act('unban', $('opName').value);
   $('opRefresh').onclick = () => refresh();
+
+  /* ---------- messages and jumpscares: straight onto someone's screen, whatever they're doing ---------- */
+  async function refreshOnline() {
+    let list; try { list = (await call('/admin/online')).online || []; } catch (_) { return; }
+    const sel = $('opTo'), keep = sel.value, others = list.filter(o => !o.owner);
+    const opts = [['*', 'Everyone online (' + others.length + ')']].concat(others.map(o => [o.name, o.name + ' · ' + o.where]));
+    if (keep !== '*' && !others.some(o => o.name === keep)) opts.push([keep, keep + ' · not online']);
+    sel.replaceChildren(...opts.map(([v, t]) => { const o = document.createElement('option'); o.value = v; o.textContent = t; return o; }));
+    sel.value = keep || '*';
+  }
+  const readUrl = f => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result)); r.onerror = () => rej(new Error("Couldn't read that picture.")); r.readAsDataURL(f); });
+  async function prepPic(f) {                                      // photos get shrunk so they arrive instantly; gifs stay animated
+    if (!/^image\/(png|jpeg|webp|gif)$/.test(f.type)) throw new Error('Pick a png, jpg, webp or gif.');
+    if (f.type === 'image/gif') { if (f.size > 1150 * 1024) throw new Error('That gif is too big (1.1 MB max).'); return readUrl(f); }
+    const url = await readUrl(f);
+    const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error("Couldn't open that picture.")); i.src = url; });
+    for (const [max, q] of [[1600, 0.85], [1280, 0.8], [1024, 0.72], [800, 0.65]]) {
+      const k = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+      const c = document.createElement('canvas'); c.width = Math.max(1, Math.round(img.naturalWidth * k)); c.height = Math.max(1, Math.round(img.naturalHeight * k));
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      const out = c.toDataURL('image/jpeg', q);
+      if (out.length * 0.75 < 1100 * 1024) return out;
+    }
+    throw new Error('That picture is too big.');
+  }
+  let pic = null;
+  $('opPic').onchange = async () => {
+    const f = $('opPic').files && $('opPic').files[0]; if (!f) return;
+    $('opSendPic').disabled = true; $('opPicInfo').textContent = 'Getting it ready…';
+    try {
+      pic = await prepPic(f);
+      $('opPrev').src = pic; $('opPrev').hidden = false; $('opSendPic').disabled = false;
+      $('opPicInfo').textContent = Math.round(pic.length * 0.75 / 1024) + ' KB · full screen for 3 s';
+    } catch (e) { pic = null; $('opPrev').hidden = true; $('opPicInfo').textContent = 'full screen for 3 s'; status(e.message, 'bad'); }
+    $('opPic').value = '';
+  };
+  async function push(kind, b, label) {
+    const to = $('opTo').value || '*';
+    const body = kind === 'msg' ? { to, kind, text: $('opMsg').value } : { to, kind, img: pic };
+    if (kind === 'msg' && !String(body.text).trim()) { status('Type a message first.', 'bad'); return; }
+    const go = async () => {
+      b.disabled = true; status('Sending…');
+      try { const r = await call('/admin/notify', body); status(r.msg, r.n ? 'good' : ''); if (kind === 'msg' && r.n) $('opMsg').value = ''; }
+      catch (e) { status(e.message, 'bad'); }
+      b.disabled = kind === 'img' && !pic;
+    };
+    if (to === '*') arm(b, label, go); else go();                 // to everyone: tap twice
+  }
+  $('opSendMsg').onclick = () => push('msg', $('opSendMsg'), 'Send');
+  $('opMsg').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); push('msg', $('opSendMsg'), 'Send'); } });
+  $('opSendPic').onclick = () => push('img', $('opSendPic'), 'Jumpscare');
   $('opName').addEventListener('input', e => { e.target.value = e.target.value.replace(/[^A-Za-z0-9]/g, '').slice(0, 20); });
 
   /* ---------- the anti-cheat box: flags from Baseplate FPS, kept until you approve (ban) or reject them ---------- */
