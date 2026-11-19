@@ -20,14 +20,16 @@
 #ownerPanel .op-status{min-height:18px;font-size:13px;color:#aab3bb}
 #ownerPanel .op-status.bad{color:#f0675d}#ownerPanel .op-status.good{color:#8fd16f}
 #ownerPanel .op-list{overflow:auto;display:grid;gap:6px}
-#ownerPanel .op-p{display:grid;grid-template-columns:1fr auto auto;gap:6px;align-items:center;padding:8px 10px;border:1px solid rgba(255,255,255,.1);border-radius:6px}
+#ownerPanel .op-p{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:6px;align-items:center;padding:8px 10px;border:1px solid rgba(255,255,255,.1);border-radius:6px}
 #ownerPanel .op-p small{display:block;color:#93a0aa;font-size:12px}
 #ownerPanel .op-head{display:flex;justify-content:space-between;align-items:center}
-#ownerPanel .op-send{display:grid;gap:6px;padding:10px;border:1px solid rgba(255,255,255,.1);border-radius:8px;background:rgba(255,255,255,.025)}
-#ownerPanel select{flex:1;min-width:0;padding:8px 9px;border-radius:6px;border:1px solid rgba(255,255,255,.18);background:#0a0c10;color:#fff;font:600 14px system-ui,sans-serif}
+#ownerPanel>*{min-width:0}
+#ownerPanel .op-row>*{min-width:0}#ownerPanel .op-row>button,#ownerPanel .op-row>label{flex:none}
+#ownerPanel .op-send{display:grid;grid-template-columns:minmax(0,1fr);min-width:0;gap:6px;padding:10px;border:1px solid rgba(255,255,255,.1);border-radius:8px;background:rgba(255,255,255,.025)}
+#ownerPanel select{flex:1;min-width:0;width:100%;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:8px 9px;border-radius:6px;border:1px solid rgba(255,255,255,.18);background:#0a0c10;color:#fff;font:600 14px system-ui,sans-serif}
 #ownerPanel .op-file{display:inline-flex;align-items:center;padding:8px 12px;border-radius:6px;border:1px dashed rgba(255,255,255,.3);color:#dfe5ea;font:700 13px system-ui,sans-serif;cursor:pointer;white-space:nowrap}
 #ownerPanel .op-prev{width:64px;height:40px;object-fit:cover;border-radius:5px;border:1px solid rgba(255,255,255,.2);background:#000}
-#ownerPanel .op-pic{align-items:center}#ownerPanel .op-pic small{flex:1;color:#93a0aa;font-size:12px}
+#ownerPanel .op-pic{align-items:center}#ownerPanel .op-pic small{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#93a0aa;font-size:12px}
 #ownerPanel .op-dot,#acBox .op-dot{display:inline-flex;align-items:center;gap:5px;margin-left:7px;padding:1px 7px 1px 5px;border:1px solid rgba(255,80,70,.6);border-radius:999px;background:rgba(255,60,50,.12);color:#ff8a80;font:700 11px system-ui,sans-serif;cursor:pointer;vertical-align:1px}
 #ownerPanel .op-dot i,#acBox .op-dot i{width:8px;height:8px;border-radius:50%;background:#ff3b30;box-shadow:0 0 6px #ff3b30}
 #ownerPanel .op-alts,#acBox .op-alts{grid-column:1/-1;margin:2px 0 0;padding:7px 9px;border-radius:6px;background:rgba(255,60,50,.08);border:1px solid rgba(255,80,70,.25);font-size:12px;color:#e7c9c6}
@@ -119,9 +121,10 @@
   async function refreshOnline() {
     let list; try { list = (await call('/admin/online')).online || []; } catch (_) { return; }
     const sel = $('opTo'), keep = sel.value, others = list.filter(o => !o.owner);
-    const opts = [['*', 'Everyone online (' + others.length + ')']].concat(others.map(o => [o.name, o.name + ' · ' + o.where]));
+    const short = w => { const g = String(w || '').split(', ').filter(Boolean); return g.length > 2 ? g.slice(0, 2).join(', ') + ' +' + (g.length - 2) + ' more' : g.join(', '); };
+    const opts = [['*', 'Everyone online (' + others.length + ')']].concat(others.map(o => [o.name, o.name + ' · ' + short(o.where), o.where]));
     if (keep !== '*' && !others.some(o => o.name === keep)) opts.push([keep, keep + ' · not online']);
-    sel.replaceChildren(...opts.map(([v, t]) => { const o = document.createElement('option'); o.value = v; o.textContent = t; return o; }));
+    sel.replaceChildren(...opts.map(([v, t, full]) => { const o = document.createElement('option'); o.value = v; o.textContent = t; if (full) o.title = full; return o; }));
     sel.value = keep || '*';
   }
   const readUrl = f => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result)); r.onerror = () => rej(new Error("Couldn't read that picture.")); r.readAsDataURL(f); });
