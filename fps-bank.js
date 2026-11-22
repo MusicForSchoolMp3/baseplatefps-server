@@ -45,6 +45,33 @@ module.exports = function createBank(ctx) {
     }
   }
 
+  // one-off gifts for one account each, given once by the server the first time that account loads (and never again,
+  // even after it's spent). Matched on the verified sign-in email, not a name typed anywhere.
+  const GIFTS = { seb: [{ id: 'birthday-2026-11', cash: 1000000000 }] };
+  const DOMAIN = ctx.EMAIL_DOMAIN || 'players.baseplatefps.game';
+  const giftDone = new Set();
+  async function gift(uid, email) {
+    const m = /^([a-z0-9]{3,20})@(.+)$/.exec(String(email || '').toLowerCase());
+    const list = m && m[2] === DOMAIN && Object.prototype.hasOwnProperty.call(GIFTS, m[1]) ? GIFTS[m[1]] : null;
+    if (!uid || !list) return;
+    for (const g of list) {
+      const key = uid + ':' + g.id;
+      if (giftDone.has(key)) continue;
+      const db = getDb();
+      if (!db) { giftDone.add(key); const b = mem.get(uid) || blank(); b.cash += g.cash; mem.set(uid, b); console.log('gift', g.id, 'given to', m[1]); continue; }
+      let gave = false;
+      const res = await db.ref('users/' + uid + '/bank').transaction(cur => {   // all in one go: can't be given twice
+        const v = cur && typeof cur === 'object' ? cur : {};
+        if (v.gifts && v.gifts[g.id]) { gave = false; return; }               // already had it: change nothing
+        v.cash = Math.max(0, Math.floor(Number(v.cash) || 0)) + g.cash;
+        v.gifts = Object.assign({}, v.gifts, { [g.id]: true });
+        gave = true; return v;
+      });
+      giftDone.add(key);
+      if (res.committed && gave) { mem.set(uid, clean(res.snapshot.val())); console.log('gift', g.id, 'given to', m[1]); }
+    }
+  }
+
   // called by the match code only. Returns the new total when it's known.
   function addCash(uid, n) {
     if (!uid || !(n > 0)) return null;
@@ -142,6 +169,7 @@ module.exports = function createBank(ctx) {
     const name = String(who.email || '').split('@')[0], owner = isOwnerWho(who);
     const path = String(req.url || '').split('?')[0];
     if (req.method === 'GET' && path === '/fps/locker') {
+      await gift(who.uid, who.email).catch(e => console.warn('gift failed', e.message));
       const b = await load(who.uid, owner);
       return json(res, 200, { cash: b.cash, own: b.own, eq: b.eq, price: COS.CRATE.price });
     }
@@ -158,5 +186,5 @@ module.exports = function createBank(ctx) {
     return json(res, 404, { error: 'Unknown request.' });
   }
 
-  return { load, addCash, open, equip, wrapsFor, handle, peek: uid => mem.get(uid) || null };
+  return { load, gift, addCash, open, equip, wrapsFor, handle, peek: uid => mem.get(uid) || null };
 };

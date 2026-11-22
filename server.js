@@ -484,6 +484,7 @@ async function onHello(p, msg) {
   const skins = Object.fromEntries(COS.WEAPON_LIST.map(w => [w, COS.skinUnlocked(w, prof.skins[w], prof.owner, prof.grants, prof.verified) ? prof.skins[w] : 'default']));
   p.skins = COS.WEAPON_LIST.map(w => skins[w] === 'default' ? '' : skins[w]).join('|');
   if (db && COS.WEAPON_LIST.some(w => !prof.savedSkins || prof.savedSkins[w] !== skins[w])) db.ref('users/' + who.uid + '/skins').set(skins).catch(e => console.warn('skins not saved for', who.uid, e.message));
+  if (BANK) await BANK.gift(who.uid, who.email).catch(e => console.warn('gift failed', e.message));   // one-off gifts (Seb's birthday cash)
   const bank = BANK ? await BANK.load(who.uid, prof.owner).catch(() => null) : null;
   if (p.ws.readyState !== 1) return;
   p.wraps = BANK && bank ? BANK.wrapsFor(bank, skins) : '';
@@ -824,7 +825,7 @@ async function banAccount(acct, me) {
    It lives in its own file with its own connections and game loop. If it ever fails to load or
    throws, Baseplate FPS carries on exactly as before. */
 try {
-  BANK = require('./fps-bank.js')({ COS, getDb: () => db, admin, verifyToken, modRec, isOwnerWho });
+  BANK = require('./fps-bank.js')({ COS, getDb: () => db, admin, verifyToken, modRec, isOwnerWho, EMAIL_DOMAIN });
   console.log('Cash and crates are on');
 } catch (e) { console.error('Cash and crates failed to start (the games are unaffected):', e && e.message); }
 try {
